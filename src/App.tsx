@@ -86,6 +86,7 @@ function App() {
 
   const [loaderCandidates, setLoaderCandidates] = useState<{ instanceId: string; candidates: LoaderCandidate[] } | null>(null);
   const [loaderSelectionInstance, setLoaderSelectionInstance] = useState<Instance | null>(null);
+  const [loaderVersionsModal, setLoaderVersionsModal] = useState<{ instance: Instance; loaderType: string; versions: string[]; includeBeta: boolean } | null>(null);
 
   const addToast = useCallback((message: string, type: "success" | "error" = "success") => {
     const id = Date.now();
@@ -506,18 +507,21 @@ function App() {
                         <div style={{ fontWeight: 600 }}>{instanceSettingsModal.loader}{instanceSettingsModal.loader_version ? ` ${instanceSettingsModal.loader_version}` : ''}</div>
                         <button className="btn btn-secondary" onClick={async () => {
                           try {
-                            const candidates = await invoke<LoaderCandidate[]>("find_loader_candidates", { instanceId: instanceSettingsModal.id, loader: instanceSettingsModal.loader });
-                            if (!candidates || candidates.length === 0) {
-                              addToast('No compatible loader versions found on Modrinth', 'error');
+                            const loaderType = instanceSettingsModal.loader;
+                            const mcVersion = instanceSettingsModal.mc_version || instanceSettingsModal.version;
+                            if (!loaderType) {
+                              addToast('No loader specified for this instance', 'error');
                               return;
                             }
-                            if (candidates.length === 1) {
-                              addToast('Downloading loader...', 'success');
-                              await invoke('download_loader_version', { instanceId: instanceSettingsModal.id, projectId: candidates[0].project_id, versionId: candidates[0].version_id });
-                            } else {
-                              setLoaderCandidates({ instanceId: instanceSettingsModal.id, candidates });
-                              setLoaderSelectionInstance(instanceSettingsModal);
+
+                            // Fetch stable loader versions (default) and show modal
+                            const versions = await invoke<string[]>('get_loader_versions', { loaderType, mcVersion, includeBeta: false });
+                            if (!versions || versions.length === 0) {
+                              addToast(`No loader versions found for this Minecraft version ${mcVersion}`, 'error');
+                              return;
                             }
+
+                            setLoaderVersionsModal({ instance: instanceSettingsModal, loaderType, versions, includeBeta: false });
                           } catch (e) {
                             addToast(String(e), 'error');
                           }
@@ -785,6 +789,54 @@ function App() {
             </div>
             <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
               <button className="btn btn-secondary" onClick={() => { setLoaderCandidates(null); setLoaderSelectionInstance(null); }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loaderVersionsModal && (
+        <div className="dialog-overlay" onClick={() => setLoaderVersionsModal(null)}>
+          <div className="dialog-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 600 }}>
+            <h2 className="dialog-title">Install {loaderVersionsModal.loaderType} Loader</h2>
+            <p className="dialog-message">Select a loader version for <strong>{loaderVersionsModal.instance.name}</strong> (MC {loaderVersionsModal.instance.version})</p>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input type="checkbox" checked={loaderVersionsModal.includeBeta} onChange={async (e) => {
+                  const include = e.target.checked;
+                  setLoaderVersionsModal({ ...loaderVersionsModal, includeBeta: include });
+                  try {
+                    const versions = await invoke<string[]>('get_loader_versions', { loaderType: loaderVersionsModal.loaderType, mcVersion: loaderVersionsModal.instance.version, includeBeta: include });
+                    setLoaderVersionsModal({ ...loaderVersionsModal, includeBeta: include, versions });
+                  } catch (err) {
+                    addToast(String(err), 'error');
+                  }
+                }} />
+                <span style={{ fontSize: '0.9rem' }}>Show beta/pre-release versions</span>
+              </label>
+            </div>
+
+            <div style={{ display: 'grid', gap: 8, maxHeight: 320, overflow: 'auto' }}>
+              {loaderVersionsModal.versions.map(v => (
+                <div key={v} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: '1px solid rgba(255,255,255,0.03)', borderRadius: 6 }}>
+                  <div style={{ fontWeight: 600 }}>{v}</div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="btn" onClick={async () => {
+                      try {
+                        addToast('Installing loader...', 'success');
+                        await invoke('install_loader', { loaderType: loaderVersionsModal.loaderType, mcVersion: loaderVersionsModal.instance.version, loaderVersion: v });
+                        setLoaderVersionsModal(null);
+                      } catch (err) {
+                        addToast(String(err), 'error');
+                      }
+                    }}>Install</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button className="btn btn-secondary" onClick={() => setLoaderVersionsModal(null)}>Cancel</button>
             </div>
           </div>
         </div>

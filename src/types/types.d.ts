@@ -34,6 +34,7 @@ export interface Instance {
     java_warning_ignored: boolean;
     loader?: string;
     loader_version?: string;
+    mc_version?: string;
 }
 
 export interface Settings {

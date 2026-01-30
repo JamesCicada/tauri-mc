@@ -76,7 +76,9 @@ pub struct ModpackIndex {
     #[serde(default)]
     pub format_version: Option<u32>,
     pub game: String,
+    /// Some packs use `version_Id` — accept it as an alias for the mc version id
     #[serde(alias = "version_Id")]
+    pub version_id: Option<String>,
     pub name: String,
     pub summary: Option<String>,
     pub files: Vec<ModpackFile>,
@@ -250,5 +252,24 @@ pub async fn install_mrpack(
         }
     }
 
+    Ok(index)
+}
+
+/// Parse and return the `modrinth.index.json` from a .mrpack without extracting files.
+pub fn parse_mrpack_index(mrpack_path: &Path) -> Result<ModpackIndex, String> {
+    let file = fs::File::open(mrpack_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    let mut index_content = String::new();
+    {
+        let mut index_file = archive
+            .by_name("modrinth.index.json")
+            .map_err(|e| e.to_string())?;
+        index_file
+            .read_to_string(&mut index_content)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let index: ModpackIndex = serde_json::from_str(&index_content).map_err(|e| e.to_string())?;
     Ok(index)
 }

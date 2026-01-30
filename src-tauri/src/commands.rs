@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -9,10 +9,13 @@ use crate::install::{install_assets, install_client_jar, install_libraries};
 use crate::instance::{Instance, InstanceState};
 use crate::java::ensure_java;
 use crate::launch::build_classpath;
-use crate::minecraft::{get_manifest, McVersion};
+use crate::minecraft::get_manifest;
 use crate::version::VersionJson;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+// Loader-related commands moved to `loader.rs` for better organization
+pub use crate::loader::*;
 
 #[derive(Default)]
 pub struct ChildProcessState(pub Mutex<HashMap<String, std::process::Child>>);
@@ -88,7 +91,8 @@ pub async fn create_instance(
     let instance = Instance {
         id,
         name,
-        version,
+        version: version.clone(),
+        mc_version: Some(version.clone()),
         state: InstanceState::Installing,
         created_at: chrono::Utc::now().timestamp() as u64,
         last_played: None,
@@ -122,16 +126,35 @@ pub async fn delete_instance(
     // If delete_version is true, we need to check if other instances use it
     if delete_version {
         let instances = list_instances(app.clone()).await?;
+        // Determine version id to delete. If the instance had a loader installed, delete the derived loader-backed version
         let version_id = {
             let meta_text =
                 fs::read_to_string(dir.join("instance.json")).map_err(|e| e.to_string())?;
             let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
-            instance.version
+            if let (Some(loader), Some(loader_version)) =
+                (instance.loader.clone(), instance.loader_version.clone())
+            {
+                format!("{}-loader-{}-{}", loader, loader_version, instance.version)
+            } else {
+                instance.version
+            }
         };
 
         let other_uses = instances
             .iter()
-            .filter(|i| i.id != instance_id && i.version == version_id)
+            .filter(|i| {
+                if i.id == instance_id {
+                    return false;
+                }
+                let other_vid = if let (Some(loader), Some(loader_version)) =
+                    (i.loader.clone(), i.loader_version.clone())
+                {
+                    format!("{}-loader-{}-{}", loader, loader_version, i.version)
+                } else {
+                    i.version.clone()
+                };
+                other_vid == version_id
+            })
             .count();
 
         if other_uses == 0 {
@@ -235,6 +258,313 @@ pub async fn download_version(
     Ok(())
 }
 
+// Ensure vanilla Minecraft version files (version JSON, client, libraries, assets) are present
+async fn ensure_vanilla_version(
+    app: &AppHandle,
+    mc_version: &str,
+) -> Result<crate::version::VersionJson, String> {
+    // Check if we already have the version json on disk
+    let version_json_path = versions_root(app)?
+        .join(mc_version)
+        .join(format!("{}.json", mc_version));
+    if version_json_path.exists() {
+        let text = std::fs::read_to_string(&version_json_path).map_err(|e| e.to_string())?;
+        let version: crate::version::VersionJson =
+            serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        return Ok(version);
+    }
+
+    // Fetch manifest and download version json
+    let manifest = get_manifest().await?;
+    let version_info = manifest
+        .versions
+        .iter()
+        .find(|v| v.id == mc_version)
+        .ok_or(format!(
+            "Minecraft version {} not found in manifest",
+            mc_version
+        ))?;
+
+    let version_json_text = crate::download::download_text(&version_info.url).await?;
+
+    std::fs::create_dir_all(version_json_path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&version_json_path, &version_json_text).map_err(|e| e.to_string())?;
+
+    let version: crate::version::VersionJson =
+        serde_json::from_str(&version_json_text).map_err(|e| e.to_string())?;
+
+    // Install client jar, libraries and assets
+    install_client_jar(app, mc_version, &version).await?;
+    install_libraries(app, &version).await?;
+    install_assets(app, &version).await?;
+
+    Ok(version)
+}
+
+#[tauri::command]
+pub async fn install_loader(
+    app: AppHandle,
+    loader_type: String,
+    mc_version: String,
+    loader_version: String,
+) -> Result<(String, String), String> {
+    // Support only fabric and quilt for now
+    // Track the effective loader version we end up using (may change due to fallback)
+    let mut effective_loader_version = loader_version.clone();
+
+    // Helper to build profile URL for a given version
+    let build_profile_url = |lt: &str, mc: &str, v: &str| -> String {
+        let v_escaped = v.replace("+", "%2B");
+        match lt {
+            "fabric" => format!(
+                "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
+                mc, v_escaped
+            ),
+            "quilt" => format!(
+                "https://meta.quiltmc.org/v3/versions/loader/{}/{}/profile/json",
+                mc, v_escaped
+            ),
+            _ => String::new(),
+        }
+    };
+
+    let mut url = build_profile_url(&loader_type, &mc_version, &effective_loader_version);
+
+    // Fetch profile JSON, with fallback: if the server reports "no loader version found",
+    // try listing available loader versions and pick a close match to retry.
+    let profile_text = match crate::download::download_text(&url).await {
+        Ok(t) => t,
+        Err(e) => {
+            // Only try the fallback for known "no loader version found" responses
+            if e.contains("no loader version found")
+                || (e.starts_with("HTTP 400") && e.contains("no loader"))
+            {
+                // Build the versions listing URL and try to resolve a real loader version
+                let list_url = match loader_type.as_str() {
+                    "fabric" => format!(
+                        "https://meta.fabricmc.net/v2/versions/loader/{}",
+                        mc_version
+                    ),
+                    "quilt" => {
+                        format!("https://meta.quiltmc.org/v3/versions/loader/{}", mc_version)
+                    }
+                    _ => return Err(e),
+                };
+
+                std::println!(
+                    "Loader version {} not found for {}, trying to resolve from list",
+                    loader_version,
+                    mc_version
+                );
+
+                let list_text = crate::download::download_text(&list_url)
+                    .await
+                    .map_err(|_| e.clone())?;
+
+                // Collect stable and beta lists and try to resolve a close match
+                let mut resolved_version: Option<String> = None;
+                let mut stable_first: Vec<String> = Vec::new();
+                let mut fallback_beta: Vec<String> = Vec::new();
+
+                if let Ok(list_val) = serde_json::from_str::<serde_json::Value>(&list_text) {
+                    if let Some(arr) = list_val.as_array() {
+                        let base_left = loader_version.split('+').next().unwrap_or(&loader_version);
+                        for item in arr {
+                            if let Some(vs) = item.get("version").and_then(|v| v.as_str()) {
+                                if vs == loader_version || vs == base_left || vs.contains(base_left)
+                                {
+                                    resolved_version = Some(vs.to_string());
+                                    break;
+                                }
+                            }
+                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                if id == loader_version || id == base_left || id.contains(base_left)
+                                {
+                                    resolved_version = Some(id.to_string());
+                                    break;
+                                }
+                            }
+
+                            // determine stable flag (Fabric uses loader.stable = true)
+                            let mut explicit_stable: Option<bool> = None;
+                            if let Some(loader_obj) = item.get("loader") {
+                                if let Some(b) = loader_obj.get("stable").and_then(|v| v.as_bool())
+                                {
+                                    explicit_stable = Some(b);
+                                }
+                            }
+                            if explicit_stable.is_none() {
+                                if let Some(b) = item.get("stable").and_then(|v| v.as_bool()) {
+                                    explicit_stable = Some(b);
+                                }
+                            }
+
+                            let s = item
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| item.get("id").and_then(|v| v.as_str()));
+                            if let Some(s) = s {
+                                if explicit_stable.unwrap_or(false) {
+                                    stable_first.push(s.to_string());
+                                } else {
+                                    fallback_beta.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Prefer a resolved match, else pick the first stable, then a beta fallback
+                if let Some(resolved) = resolved_version {
+                    effective_loader_version = resolved.clone();
+                } else if let Some(sv) = stable_first.get(0) {
+                    effective_loader_version = sv.clone();
+                } else if let Some(bv) = fallback_beta.get(0) {
+                    effective_loader_version = bv.clone();
+                } else {
+                    return Err(e);
+                }
+
+                // rebuild URL with chosen version and retry
+                url = build_profile_url(&loader_type, &mc_version, &effective_loader_version);
+                crate::download::download_text(&url)
+                    .await
+                    .map_err(|_| e.clone())?
+            } else {
+                return Err(e);
+            }
+        }
+    };
+
+    // Parse and validate inheritsFrom (include a truncated response snippet on parse errors)
+    let profile_json: serde_json::Value = serde_json::from_str(&profile_text).map_err(|e| {
+        let snippet: String = profile_text.chars().take(200).collect();
+        format!("{} - response (truncated): {}", e.to_string(), snippet)
+    })?;
+    let inherits = profile_json
+        .get("inheritsFrom")
+        .and_then(|v| v.as_str())
+        .ok_or("profile missing inheritsFrom")?;
+
+    if inherits != mc_version {
+        return Err(format!(
+            "profile inheritsFrom mismatch: expected {}, found {}",
+            mc_version, inherits
+        ));
+    }
+
+    // Map into our VersionJson struct (this will ignore extra profile fields)
+    // Derived version id format: <loader>-loader-<loaderVersion>-<mcVersion>
+    let derived_id = format!(
+        "{}-loader-{}-{}",
+        loader_type, effective_loader_version, mc_version
+    );
+
+    let derived_dir = versions_root(&app)?.join(&derived_id);
+    std::fs::create_dir_all(&derived_dir).map_err(|e| e.to_string())?;
+    let derived_json_path = derived_dir.join(format!("{}.json", derived_id));
+    if derived_json_path.exists() {
+        return Ok((derived_id, effective_loader_version));
+    }
+
+    // Try to map profile into our VersionJson; if it doesn't fit, fall back to vanilla version
+    let version_json: VersionJson = match serde_json::from_value(profile_json.clone()) {
+        Ok(v) => v,
+        Err(_) => {
+            // Fallback: use vanilla mc files, but try to merge loader-provided libraries/downloads
+            let base = ensure_vanilla_version(&app, &mc_version).await?;
+
+            // Start from vanilla and then append loader libraries if present in profile.json
+            let mut libraries = base.libraries.clone();
+
+            if let Some(arr) = profile_json.get("libraries").and_then(|v| v.as_array()) {
+                for lib in arr {
+                    if let Some(name) = lib.get("name").and_then(|v| v.as_str()) {
+                        // Try to get downloads.artifact info
+                        let mut artifact_opt: Option<crate::version::Artifact> = None;
+                        if let Some(dl) = lib.get("downloads").and_then(|v| v.get("artifact")) {
+                            if let (Some(url), Some(path), Some(sha1), Some(size)) = (
+                                dl.get("url").and_then(|v| v.as_str()),
+                                dl.get("path").and_then(|v| v.as_str()),
+                                dl.get("sha1").and_then(|v| v.as_str()),
+                                dl.get("size").and_then(|v| v.as_u64()),
+                            ) {
+                                artifact_opt = Some(crate::version::Artifact {
+                                    path: path.to_string(),
+                                    url: url.to_string(),
+                                    sha1: sha1.to_string(),
+                                    size: size as u64,
+                                });
+                            }
+                        }
+
+                        let lib_struct = crate::version::Library {
+                            name: name.to_string(),
+                            downloads: crate::version::LibraryDownloads {
+                                artifact: artifact_opt,
+                                classifiers: std::collections::HashMap::new(),
+                            },
+                            natives: std::collections::HashMap::new(),
+                            rules: Vec::new(),
+                        };
+
+                        libraries.push(lib_struct);
+                    }
+                }
+            }
+
+            // For downloads, prefer profile client if present
+            let downloads = if let Some(client_dl) =
+                profile_json.get("downloads").and_then(|v| v.get("client"))
+            {
+                if let (Some(url), Some(sha1), Some(size)) = (
+                    client_dl.get("url").and_then(|v| v.as_str()),
+                    client_dl.get("sha1").and_then(|v| v.as_str()),
+                    client_dl.get("size").and_then(|v| v.as_u64()),
+                ) {
+                    crate::version::Downloads {
+                        client: crate::version::DownloadInfo {
+                            url: url.to_string(),
+                            sha1: sha1.to_string(),
+                            size: size as u64,
+                        },
+                    }
+                } else {
+                    base.downloads.clone()
+                }
+            } else {
+                base.downloads.clone()
+            };
+
+            let main_class = profile_json
+                .get("mainClass")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&base.mainClass)
+                .to_string();
+
+            crate::version::VersionJson {
+                libraries,
+                downloads,
+                mainClass: main_class,
+                assetIndex: base.assetIndex.clone(),
+            }
+        }
+    };
+
+    // Persist the derived version JSON (pretty) so the launcher treats it as a distinct version
+    let derived_text = serde_json::to_string_pretty(&version_json).map_err(|e| e.to_string())?;
+    std::fs::write(&derived_json_path, &derived_text).map_err(|e| e.to_string())?;
+
+    // Install client/jar, libraries and assets for the derived version
+    install_client_jar(&app, &derived_id, &version_json).await?;
+    install_libraries(&app, &version_json).await?;
+    install_assets(&app, &version_json).await?;
+
+    Ok((derived_id, effective_loader_version))
+}
+
+// `get_loader_versions` has been moved to `loader.rs` and is re-exported. See `src-tauri/src/loader.rs` for implementation.
+
 #[derive(Serialize, Clone)]
 pub struct InstanceLog {
     pub instance_id: String,
@@ -257,17 +587,161 @@ pub async fn launch_instance(
 
     let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
 
-    let version_id = &instance.version;
+    // Determine the version JSON to use: if loader info is present, prefer derived loader-backed version; otherwise use instance.version
+    let version_id = if let (Some(loader), Some(loader_v), Some(mc_v)) = (
+        instance.loader.clone(),
+        instance.loader_version.clone(),
+        instance.mc_version.clone(),
+    ) {
+        format!("{}-loader-{}-{}", loader, loader_v, mc_v)
+    } else if let (Some(loader), Some(loader_v)) =
+        (instance.loader.clone(), instance.loader_version.clone())
+    {
+        // Fallback: use instance.version as mc version
+        format!("{}-loader-{}-{}", loader, loader_v, instance.version)
+    } else {
+        instance.version.clone()
+    };
 
     let version_json_path = versions_root(&app)?
-        .join(version_id)
+        .join(&version_id)
         .join(format!("{version_id}.json"));
 
-    let text = fs::read_to_string(&version_json_path).map_err(|e| e.to_string())?;
+    // If the derived version JSON is missing, attempt recovery:
+    // - If we have loader info on the instance, try to install the loader (creates derived version)
+    // - Otherwise try to ensure vanilla version files
+    if !version_json_path.exists() {
+        if let (Some(loader), Some(loader_v)) =
+            (instance.loader.clone(), instance.loader_version.clone())
+        {
+            let mc_v = instance
+                .mc_version
+                .clone()
+                .unwrap_or(instance.version.clone());
+            let _ = app.emit(
+                "loader-install-log",
+                format!(
+                    "Derived version {} missing, attempting to install loader {} {}",
+                    version_id, loader, loader_v
+                ),
+            );
+            match install_loader(app.clone(), loader.clone(), mc_v.clone(), loader_v.clone()).await
+            {
+                Ok((_derived, used_version)) => {
+                    // success — derived version should now exist (used_version is the actual loader version chosen)
+                    let _ = app.emit(
+                        "loader-install-log",
+                        format!(
+                            "install_loader resolved loader version: {} -> {}",
+                            loader_v, used_version
+                        ),
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Derived version {} missing and install_loader failed: {}",
+                        version_id, e
+                    ));
+                }
+            }
+        } else {
+            // No loader info -> try to ensure vanilla version json exists/install it
+            if let Err(e) = ensure_vanilla_version(&app, &instance.version).await {
+                return Err(format!(
+                    "Version JSON missing at {} and failed to install vanilla {}: {}",
+                    version_json_path.to_string_lossy(),
+                    instance.version,
+                    e
+                ));
+            }
+        }
+    }
 
-    let version: VersionJson = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // Re-check that the JSON exists after recovery attempt
+    if !version_json_path.exists() {
+        return Err(format!(
+            "Version JSON not found at path: {}",
+            version_json_path.to_string_lossy()
+        ));
+    }
 
-    let classpath = build_classpath(&app, version_id, &version)?;
+    let text = fs::read_to_string(&version_json_path).map_err(|e| {
+        format!(
+            "Failed to read version JSON at {}: {}",
+            version_json_path.to_string_lossy(),
+            e.to_string()
+        )
+    })?;
+
+    let version: VersionJson = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "Failed to parse version JSON at {}: {}",
+            version_json_path.to_string_lossy(),
+            e.to_string()
+        )
+    })?;
+
+    // Confirm client JAR exists too and if missing, attempt to recover similarly
+    let client_jar = versions_root(&app)?
+        .join(&version_id)
+        .join(format!("{}.jar", version_id));
+    if !client_jar.exists() {
+        if let (Some(loader), Some(loader_v)) =
+            (instance.loader.clone(), instance.loader_version.clone())
+        {
+            let mc_v = instance
+                .mc_version
+                .clone()
+                .unwrap_or(instance.version.clone());
+            let _ = app.emit(
+                "loader-install-log",
+                format!(
+                    "Client JAR missing for {} - attempting loader install {} {}",
+                    version_id, loader, loader_v
+                ),
+            );
+            match install_loader(app.clone(), loader.clone(), mc_v.clone(), loader_v.clone()).await
+            {
+                Ok((_derived, used_version)) => {
+                    let _ = app.emit(
+                        "loader-install-log",
+                        format!(
+                            "install_loader resolved loader version: {} -> {}",
+                            loader_v, used_version
+                        ),
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Client JAR missing at {} and failed to install loader {} {}: {}",
+                        client_jar.to_string_lossy(),
+                        loader,
+                        loader_v,
+                        e
+                    ));
+                }
+            }
+        } else {
+            // Try to install vanilla client jar
+            if let Err(e) = install_client_jar(&app, &instance.version, &version).await {
+                return Err(format!(
+                    "Client JAR missing at {} and failed to install vanilla client for {}: {}",
+                    client_jar.to_string_lossy(),
+                    instance.version,
+                    e
+                ));
+            }
+        }
+
+        if !client_jar.exists() {
+            return Err(format!(
+                "Client JAR not found at path: {}",
+                client_jar.to_string_lossy()
+            ));
+        }
+    }
+
+    let classpath = build_classpath(&app, &version_id, &version)?;
     let mc_root = minecraft_root(&app)?;
 
     let settings = crate::settings::get_settings(app.clone()).unwrap_or_default();
@@ -473,7 +947,9 @@ pub async fn check_java_compatibility(
         fs::read_to_string(instance_root.join("instance.json")).map_err(|e| e.to_string())?;
     let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
 
-    let required_version = crate::java::get_required_java_version(&instance.version);
+    // Use the base Minecraft version if present (derived loader versions have a different id)
+    let mc_version_for_java = instance.mc_version.as_deref().unwrap_or(&instance.version);
+    let required_version = crate::java::get_required_java_version(mc_version_for_java);
     let path = crate::java::get_intended_java_path(&app, &instance);
 
     // Global setting: skip java compatibility entirely
@@ -540,153 +1016,9 @@ pub async fn get_popular_mods(
     crate::modrinth::search_popular_mods(l).await
 }
 
-#[derive(Serialize, Clone)]
-pub struct LoaderCandidate {
-    pub project_id: String,
-    pub project_title: String,
-    pub version_id: String,
-    pub version_number: String,
-    pub game_versions: Vec<String>,
-}
+// Loader types and verification moved to `loader.rs` (see `loader` module).
 
-#[derive(Serialize, Clone)]
-pub struct LoaderInstalled {
-    pub instance_id: String,
-    pub project_id: String,
-    pub version_id: String,
-    pub success: bool,
-}
-
-fn loader_verification(mc_dir: &std::path::Path, project_id: &str) -> bool {
-    // Heuristic checks: look for version folders or libraries that indicate Fabric/Quilt
-    let versions_dir = mc_dir.join("versions");
-    if versions_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&versions_dir) {
-            for e in entries.flatten() {
-                if let Ok(name) = e.file_name().into_string() {
-                    let lname = name.to_lowercase();
-                    let pid = project_id.to_lowercase();
-                    if pid.contains("fabric") && lname.contains("fabric") {
-                        return true;
-                    }
-                    if pid.contains("quilt") && lname.contains("quilt") {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    let libs = mc_dir.join("libraries");
-    if libs.exists() {
-        let pid = project_id.to_lowercase();
-        let mut stack: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&libs) {
-            for e in entries.flatten() {
-                stack.push(e.path());
-            }
-        }
-        while let Some(p) = stack.pop() {
-            if p.is_dir() {
-                if let Ok(iter) = std::fs::read_dir(&p) {
-                    for e in iter.flatten() {
-                        stack.push(e.path());
-                    }
-                }
-            } else if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                let lname = name.to_lowercase();
-                if pid.contains("fabric") && lname.contains("fabric") {
-                    return true;
-                }
-                if pid.contains("quilt") && lname.contains("quilt") {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-#[tauri::command]
-pub async fn find_loader_candidates(
-    app: AppHandle,
-    instance_id: String,
-    loader: String,
-) -> Result<Vec<LoaderCandidate>, String> {
-    // Read instance to get game version
-    let root = instance_dir(&app, &instance_id)?;
-    let meta_text =
-        std::fs::read_to_string(root.join("instance.json")).map_err(|e| e.to_string())?;
-    let inst: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
-    let mc_version = inst.version.clone();
-
-    // Search Modrinth for projects matching loader term
-    let search = crate::modrinth::search_projects(&loader, "mod").await?;
-    let mut results: Vec<LoaderCandidate> = Vec::new();
-
-    // Also include popular/popular loader projects by searching for common loader names if initial search returned none
-    if search.hits.is_empty() {
-        let common = vec!["fabric", "forge", "quilt"];
-        for name in common.iter() {
-            if let Ok(pop) = crate::modrinth::search_projects(name, "mod").await {
-                for hit in pop.hits {
-                    if let Ok(versions) =
-                        crate::modrinth::get_project_versions(&hit.project_id).await
-                    {
-                        for v in versions {
-                            if v.game_versions.iter().any(|g| g == &mc_version) {
-                                results.push(LoaderCandidate {
-                                    project_id: hit.project_id.clone(),
-                                    project_title: hit.title.clone(),
-                                    version_id: v.id.clone(),
-                                    version_number: v.version_number.clone(),
-                                    game_versions: v.game_versions.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for hit in search.hits.iter() {
-            if let Ok(versions) = crate::modrinth::get_project_versions(&hit.project_id).await {
-                for v in versions.into_iter() {
-                    // Compatible if version.game_versions includes mc_version
-                    if v.game_versions.iter().any(|g| g == &mc_version) {
-                        results.push(LoaderCandidate {
-                            project_id: hit.project_id.clone(),
-                            project_title: hit.title.clone(),
-                            version_id: v.id.clone(),
-                            version_number: v.version_number.clone(),
-                            game_versions: v.game_versions.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    for hit in search.hits.iter() {
-        if let Ok(versions) = crate::modrinth::get_project_versions(&hit.project_id).await {
-            for v in versions.into_iter() {
-                // Compatible if version.game_versions includes mc_version
-                if v.game_versions.iter().any(|g| g == &mc_version) {
-                    results.push(LoaderCandidate {
-                        project_id: hit.project_id.clone(),
-                        project_title: hit.title.clone(),
-                        version_id: v.id.clone(),
-                        version_number: v.version_number.clone(),
-                        game_versions: v.game_versions.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(results)
-}
+// `find_loader_candidates` moved to `loader.rs` (re-exported from commands via `pub use loader::*`).
 
 #[tauri::command]
 pub async fn download_loader_version(
@@ -708,10 +1040,27 @@ pub async fn download_loader_version(
         crate::download::download_to_file(&file.url, &target).await?;
     }
 
-    // Update instance metadata to record loader presence after download
+    // Determine loader type from Modrinth version metadata (prefer explicit loader names like fabric/quilt)
+    let loader_type = if let Some(l) = version.loaders.first() {
+        let lt = l.to_lowercase();
+        if lt.contains("fabric") {
+            "fabric".to_string()
+        } else if lt.contains("quilt") {
+            "quilt".to_string()
+        } else if lt.contains("forge") {
+            "forge".to_string()
+        } else {
+            l.clone()
+        }
+    } else {
+        // Fallback to project_id (last resort)
+        project_id.clone()
+    };
+
+    // Update instance metadata to record loader presence after download (store loader type & version)
     if let Ok(meta_text) = std::fs::read_to_string(root.join("instance.json")) {
         if let Ok(mut inst) = serde_json::from_str::<Instance>(&meta_text) {
-            inst.loader = Some(project_id.clone());
+            inst.loader = Some(loader_type.clone());
             inst.loader_version = Some(version.version_number.clone());
             let _ = std::fs::write(
                 root.join("instance.json"),
@@ -742,14 +1091,32 @@ pub async fn download_loader_version(
                     let instance_version = instance_obj.version.clone();
                     let java_cmd = crate::java::get_intended_java_path(&app, &instance_obj);
 
+                    // Determine loader type for verification (prefer explicit loader names)
+                    let loader_type_for_verify = if let Some(l) = version.loaders.first() {
+                        let lt = l.to_lowercase();
+                        if lt.contains("fabric") {
+                            "fabric".to_string()
+                        } else if lt.contains("quilt") {
+                            "quilt".to_string()
+                        } else {
+                            l.clone()
+                        }
+                    } else {
+                        project_id.clone()
+                    };
+
                     // Clone for thread
                     let app_clone = app.clone();
                     let iid = instance_id.clone();
                     let pid = project_id.clone();
-                    let vid = version_id.clone();
+                    let _vid = version_id.clone(); // kept for reference if needed
+                                                   // Use the loader's version number (e.g., "0.141.2+1.21.11") for installer arguments and verification
+                    let loader_number = version.version_number.clone();
                     let mc_dir_str = mc_dir.to_string_lossy().to_string();
                     let installer = installer_path.clone();
                     let java = java_cmd.clone();
+                    let loader_type_for_verify = loader_type_for_verify.clone();
+                    let loader_number = loader_number.clone();
 
                     std::thread::spawn(move || {
                         use std::io::{BufRead, BufReader};
@@ -767,7 +1134,7 @@ pub async fn download_loader_version(
                             .arg("-mcversion")
                             .arg(&instance_version)
                             .arg("-loader")
-                            .arg(&vid)
+                            .arg(&loader_number)
                             .arg("-y");
 
                         if let Ok(mut child) = cmd
@@ -801,9 +1168,20 @@ pub async fn download_loader_version(
                             }
                             let _ = child.wait();
 
-                            // Verify installation heuristically
+                            // Verify installation: if Fabric, use `fabric_installed` with explicit versions; otherwise use heuristic `loader_verification`.
                             let success =
-                                loader_verification(std::path::Path::new(&mc_dir_str), &pid);
+                                if loader_type_for_verify.to_lowercase().contains("fabric") {
+                                    crate::loader::fabric_installed(
+                                        std::path::Path::new(&mc_dir_str),
+                                        &instance_version,
+                                        &loader_number,
+                                    )
+                                } else {
+                                    crate::loader::loader_verification(
+                                        std::path::Path::new(&mc_dir_str),
+                                        &loader_type_for_verify,
+                                    )
+                                };
 
                             // Mark instance metadata (already set) and emit installed event with details
                             let _ = app_clone.emit(
@@ -811,23 +1189,89 @@ pub async fn download_loader_version(
                                 LoaderInstalled {
                                     instance_id: iid.clone(),
                                     project_id: pid.clone(),
-                                    version_id: vid.clone(),
+                                    version_id: loader_number.clone(),
                                     success,
                                 },
                             );
+
+                            // Ensure derived version JSON exists by calling `install_loader` asynchronously.
+                            if success {
+                                let app_for_install = app_clone.clone();
+                                let lt = loader_type_for_verify.clone();
+                                let mc_v = instance_version.clone();
+                                let lnum = loader_number.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    match crate::commands::install_loader(
+                                        app_for_install.clone(),
+                                        lt,
+                                        mc_v,
+                                        lnum,
+                                    )
+                                    .await
+                                    {
+                                        Ok((derived_id, used_version)) => {
+                                            let _ = app_for_install.emit("loader-install-log", format!("install_loader created derived version {} (used {})", derived_id, used_version));
+                                        }
+                                        Err(e) => {
+                                            let _ = app_for_install.emit(
+                                                "loader-install-log",
+                                                format!("install_loader failed: {}", e),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
                         } else {
-                            // Could not spawn installer, attempt verification
+                            // Could not spawn installer, attempt verification (use normalized loader type)
                             let success =
-                                loader_verification(std::path::Path::new(&mc_dir_str), &pid);
+                                if loader_type_for_verify.to_lowercase().contains("fabric") {
+                                    crate::loader::fabric_installed(
+                                        std::path::Path::new(&mc_dir_str),
+                                        &instance_version,
+                                        &loader_number,
+                                    )
+                                } else {
+                                    crate::loader::loader_verification(
+                                        std::path::Path::new(&mc_dir_str),
+                                        &loader_type_for_verify,
+                                    )
+                                };
                             let _ = app_clone.emit(
                                 "loader-installed",
                                 LoaderInstalled {
                                     instance_id: iid.clone(),
                                     project_id: pid.clone(),
-                                    version_id: vid.clone(),
+                                    version_id: loader_number.clone(),
                                     success,
                                 },
                             );
+
+                            if success {
+                                let app_for_install = app_clone.clone();
+                                let lt = loader_type_for_verify.clone();
+                                let mc_v = instance_version.clone();
+                                let lnum = loader_number.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    match crate::commands::install_loader(
+                                        app_for_install.clone(),
+                                        lt,
+                                        mc_v,
+                                        lnum,
+                                    )
+                                    .await
+                                    {
+                                        Ok((derived_id, used_version)) => {
+                                            let _ = app_for_install.emit("loader-install-log", format!("install_loader created derived version {} (used {})", derived_id, used_version));
+                                        }
+                                        Err(e) => {
+                                            let _ = app_for_install.emit(
+                                                "loader-install-log",
+                                                format!("install_loader failed: {}", e),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
                         }
                     });
 
@@ -838,7 +1282,7 @@ pub async fn download_loader_version(
     }
 
     // No installer found, attempt verification and emit installed event (may be partial)
-    let success = loader_verification(&mc_dir, &project_id);
+    let success = crate::loader::loader_verification(&mc_dir, &loader_type);
     let _ = app
         .emit(
             "loader-installed",
@@ -885,6 +1329,7 @@ pub async fn install_modpack_version(
         id: inst_id.clone(),
         name,
         version: game_version.clone(),
+        mc_version: Some(game_version.clone()),
         state: InstanceState::Installing,
         created_at: chrono::Utc::now().timestamp() as u64,
         last_played: None,
@@ -902,62 +1347,274 @@ pub async fn install_modpack_version(
     let json = serde_json::to_string_pretty(&instance).map_err(|e| e.to_string())?;
     fs::write(&meta_path, json).map_err(|e| e.to_string())?;
 
-    // Download files and handle modpack (.mrpack) extraction
-    let mods_dir = root.join(".minecraft").join("mods");
-    fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
+    // Check for a .mrpack file to parse modpack metadata (preferred)
+
+    let mut mrpack_index_opt: Option<crate::modrinth::ModpackIndex> = None;
 
     for file in &version.files {
-        // If a modpack file is present, download and extract it to the instance
         if file.filename.to_lowercase().ends_with(".mrpack") {
             let target = root.join(&file.filename);
             crate::download::download_to_file(&file.url, &target).await?;
-            // Install contents of mrpack into the instance (.minecraft)
-            let _index = crate::modrinth::install_mrpack(&app, &inst_id, &target).await?;
-            // Remove the mrpack archive after extraction to avoid clutter
-            let _ = std::fs::remove_file(&target);
+            // Parse modpack index only (do not extract yet)
+            match crate::modrinth::parse_mrpack_index(&target) {
+                Ok(idx) => {
+                    mrpack_index_opt = Some(idx);
+                }
+                Err(e) => {
+                    // Parsing failed; remove file and continue with fallback
+                    let _ = std::fs::remove_file(&target);
+                    let _ = app.emit(
+                        "instance-install-error",
+                        format!("Failed to parse modpack: {}", e),
+                    );
+                }
+            }
+            break;
+        }
+    }
+
+    // If we found an mrpack index, use it for mc version & loader detection
+    let (resolved_mc_version, loader_type_opt, loader_version_opt) =
+        if let Some(idx) = mrpack_index_opt {
+            // Prefer explicit version_id from index, but fall back to the modrinth game version
+            let mc_ver = idx
+                .version_id
+                .clone()
+                .unwrap_or_else(|| game_version.clone());
+            // Detect loader from dependencies (keys like 'fabric' or 'fabric-loader') or fallback to version.loaders
+            let mut loader_t: Option<String> = None;
+            let mut loader_v: Option<String> = None;
+            for (k, v) in idx.dependencies.iter() {
+                let key = k.to_lowercase();
+                if key.contains("fabric") || key.contains("quilt") || key.contains("forge") {
+                    loader_t = Some(key.clone());
+                    loader_v = Some(v.clone());
+                    break;
+                }
+            }
+            (mc_ver, loader_t, loader_v)
         } else {
+            // No mrpack or failed parse → fallback to modrinth version metadata
+            let loader_t = version.loaders.first().cloned();
+            (
+                game_version.clone(),
+                loader_t,
+                Some(version.version_number.clone()),
+            )
+        };
+
+    // Ensure vanilla is installed for the resolved mc version
+    let mut chosen_loader: Option<String> = None;
+    let mut chosen_loader_version: Option<String> = None;
+    let _base_version = ensure_vanilla_version(&app, &resolved_mc_version).await?;
+
+    // If loader info found, attempt to install loader and get derived version id
+    if let Some(loader_t) = loader_type_opt {
+        // Normalize loader type name (fabric/quilt)
+        let lt = if loader_t.contains("fabric") {
+            "fabric".to_string()
+        } else if loader_t.contains("quilt") {
+            "quilt".to_string()
+        } else if loader_t.contains("forge") {
+            "forge".to_string()
+        } else {
+            loader_t.clone()
+        };
+
+        if lt == "forge" {
+            // Forge intentionally not supported in this step
+            let mut inst_err = instance.clone();
+            inst_err.state = InstanceState::Error;
+            let _ = fs::write(
+                &meta_path,
+                serde_json::to_string_pretty(&inst_err).map_err(|e| e.to_string())?,
+            );
+            let _ = app.emit(
+                "instance-install-error",
+                "Forge modpacks are not supported yet (loader install required)",
+            );
+            return Err("Forge modpacks are not supported yet".to_string());
+        }
+
+        // Use loader_version_opt if available, else fall back to the detected loader_version from modrinth files
+        let loader_v = loader_version_opt.unwrap_or_else(|| version.version_number.clone());
+
+        // Attempt to install the loader and record chosen loader info
+        // Try installing the requested loader version; if verification fails, auto-try other candidate versions
+        match install_loader(
+            app.clone(),
+            lt.clone(),
+            resolved_mc_version.clone(),
+            loader_v.clone(),
+        )
+        .await
+        {
+            Ok((_derived, used_version)) => {
+                chosen_loader = Some(lt.clone());
+                chosen_loader_version = Some(used_version.clone());
+                let _ = app.emit(
+                    "loader-install-log",
+                    format!(
+                        "Installed loader: {} {} (requested {})",
+                        lt, &used_version, &loader_v
+                    ),
+                );
+
+                // Verify installation: use `fabric_installed` when the loader is Fabric, otherwise fall back to heuristic `loader_verification`.
+                let mc_dir = root.join(".minecraft");
+                let mut success = if lt.to_lowercase().contains("fabric") {
+                    crate::loader::fabric_installed(&mc_dir, &resolved_mc_version, &used_version)
+                } else {
+                    crate::loader::loader_verification(&mc_dir, &lt)
+                };
+
+                // If verification failed, attempt automatic fallback to other versions (stable first, then beta)
+                if !success {
+                    let mut versions =
+                        match get_loader_versions(lt.clone(), resolved_mc_version.clone(), false)
+                            .await
+                        {
+                            Ok(vs) => vs,
+                            Err(_) => Vec::new(),
+                        };
+                    if versions.is_empty() {
+                        // include beta if no stable found
+                        versions = match get_loader_versions(
+                            lt.clone(),
+                            resolved_mc_version.clone(),
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(vs) => vs,
+                            Err(_) => Vec::new(),
+                        };
+                    }
+
+                    for v in versions.into_iter() {
+                        if v == used_version {
+                            continue;
+                        }
+                        let _ = app.emit(
+                            "loader-install-log",
+                            format!("Retrying loader install with {} {}", lt, v),
+                        );
+                        if let Ok((_d2, used_v2)) = install_loader(
+                            app.clone(),
+                            lt.clone(),
+                            resolved_mc_version.clone(),
+                            v.clone(),
+                        )
+                        .await
+                        {
+                            // Re-verify after install
+                            let s2 = if lt.to_lowercase().contains("fabric") {
+                                crate::loader::fabric_installed(
+                                    &mc_dir,
+                                    &resolved_mc_version,
+                                    &used_v2,
+                                )
+                            } else {
+                                crate::loader::loader_verification(&mc_dir, &lt)
+                            };
+                            if s2 {
+                                success = true;
+                                chosen_loader_version = Some(used_v2.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Persist loader info into instance metadata immediately (use chosen version)
+                if let Ok(inst_meta_text) = std::fs::read_to_string(&meta_path) {
+                    if let Ok(mut inst_meta) = serde_json::from_str::<Instance>(&inst_meta_text) {
+                        inst_meta.loader = Some(lt.clone());
+                        if let Some(rv) = &chosen_loader_version {
+                            inst_meta.loader_version = Some(rv.clone());
+                        }
+                        let _ = std::fs::write(
+                            &meta_path,
+                            serde_json::to_string_pretty(&inst_meta).map_err(|e| e.to_string())?,
+                        );
+                    }
+                }
+
+                // Emit a loader-installed event so frontend can react
+                let _ = app.emit(
+                    "loader-installed",
+                    LoaderInstalled {
+                        instance_id: inst_id.clone(),
+                        project_id: lt.clone(),
+                        version_id: chosen_loader_version.clone().unwrap_or(loader_v.clone()),
+                        success,
+                    },
+                );
+
+                if !success {
+                    // Treat as error if we couldn't verify after trying alternatives
+                    let mut inst_err = instance.clone();
+                    inst_err.state = InstanceState::Error;
+                    let _ = fs::write(
+                        &meta_path,
+                        serde_json::to_string_pretty(&inst_err).map_err(|e| e.to_string())?,
+                    );
+                    let _ = app.emit(
+                        "instance-install-error",
+                        format!("Loader install failed to verify for {}", lt),
+                    );
+                    return Err(format!("Loader install failed to verify for {}", lt));
+                }
+            }
+            Err(e) => {
+                let mut inst_err = instance.clone();
+                inst_err.state = InstanceState::Error;
+                let _ = fs::write(
+                    &meta_path,
+                    serde_json::to_string_pretty(&inst_err).map_err(|e| e.to_string())?,
+                );
+                let _ = app.emit(
+                    "instance-install-error",
+                    format!("Loader install failed: {}", e),
+                );
+                return Err(format!("Loader install failed: {}", e));
+            }
+        }
+    }
+
+    // Now actually extract and install the modpack contents (mods, overrides)
+    // If we previously downloaded a .mrpack file, find it and call install_mrpack; otherwise download and install files individually
+    let mut mrpack_found = false;
+    for file in &version.files {
+        if file.filename.to_lowercase().ends_with(".mrpack") {
+            let target = root.join(&file.filename);
+            if target.exists() {
+                let _index = crate::modrinth::install_mrpack(&app, &inst_id, &target).await?;
+                let _ = std::fs::remove_file(&target);
+                mrpack_found = true;
+            }
+            break;
+        }
+    }
+
+    if !mrpack_found {
+        // No pack archive -> download files into mods dir
+        let mods_dir = root.join(".minecraft").join("mods");
+        fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
+        for file in &version.files {
             let target = mods_dir.join(&file.filename);
             crate::download::download_to_file(&file.url, &target).await?;
         }
     }
 
-    // If the Modrinth version lists a loader, try to find and auto-install a candidate
-    if let Some(loader_name) = version.loaders.first().cloned() {
-        if let Ok(mut candidates) =
-            find_loader_candidates(app.clone(), inst_id.clone(), loader_name.clone()).await
-        {
-            if !candidates.is_empty() {
-                // Prefer quilt/fabric/forge in that order when choosing a loader automatically
-                candidates.sort_by_key(|c| {
-                    let title = c.project_title.to_lowercase();
-                    if title.contains("quilt") {
-                        0
-                    } else if title.contains("fabric") {
-                        1
-                    } else if title.contains("forge") {
-                        2
-                    } else {
-                        3
-                    }
-                });
-
-                if let Some(pick) = candidates.first() {
-                    // Attempt to download and run installer for the chosen loader version
-                    let _ = download_loader_version(
-                        app.clone(),
-                        inst_id.clone(),
-                        pick.project_id.clone(),
-                        pick.version_id.clone(),
-                    )
-                    .await;
-                }
-            }
-        }
-    }
-
-    // Update state to Ready
+    // Update instance to use Minecraft base version and mark Ready. Store loader info in loader fields.
     let mut ready_inst = instance;
+    ready_inst.version = resolved_mc_version.clone();
     ready_inst.state = InstanceState::Ready;
+    if chosen_loader.is_some() {
+        ready_inst.loader = chosen_loader.clone();
+        ready_inst.loader_version = chosen_loader_version.clone();
+    }
     let json = serde_json::to_string_pretty(&ready_inst).map_err(|e| e.to_string())?;
     fs::write(&meta_path, json).map_err(|e| e.to_string())?;
 

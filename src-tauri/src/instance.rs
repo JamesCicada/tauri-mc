@@ -24,6 +24,8 @@ pub struct Instance {
     pub loader: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loader_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mc_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

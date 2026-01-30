@@ -5,6 +5,7 @@ mod install;
 mod instance;
 mod java;
 mod launch;
+mod loader;
 mod minecraft;
 mod modrinth;
 mod rules;
@@ -13,10 +14,10 @@ mod version;
 
 use commands::{
     check_java_compatibility, check_version_usage, create_instance, delete_instance,
-    download_loader_version, download_version, find_loader_candidates, get_popular_mods,
-    get_project_versions, get_version_manifest, install_modpack_version, install_modrinth_mod,
-    kill_instance, launch_instance, list_instances, save_instance, search_projects,
-    ChildProcessState,
+    download_loader_version, download_version, find_loader_candidates, get_loader_versions,
+    get_popular_mods, get_project_versions, get_version_manifest, install_loader,
+    install_modpack_version, install_modrinth_mod, kill_instance, launch_instance, list_instances,
+    save_instance, search_projects, ChildProcessState,
 };
 use settings::{get_settings, save_settings};
 use tauri::Manager;
@@ -78,6 +79,8 @@ fn main() {
             install_modrinth_mod,
             find_loader_candidates,
             download_loader_version,
+            install_loader,
+            get_loader_versions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

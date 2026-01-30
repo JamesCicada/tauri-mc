@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AssetIndex {
     pub id: String,
     pub url: String,
@@ -8,7 +8,7 @@ pub struct AssetIndex {
     pub size: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct VersionJson {
     pub libraries: Vec<Library>,
     pub downloads: Downloads,
@@ -16,7 +16,7 @@ pub struct VersionJson {
     pub assetIndex: AssetIndex,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Library {
     pub name: String,
     pub downloads: LibraryDownloads,
@@ -26,14 +26,14 @@ pub struct Library {
     pub rules: Vec<Rule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LibraryDownloads {
     pub artifact: Option<Artifact>,
     #[serde(default)]
     pub classifiers: std::collections::HashMap<String, Artifact>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Artifact {
     pub path: String,
     pub url: String,
@@ -41,24 +41,24 @@ pub struct Artifact {
     pub size: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Rule {
     pub action: String,
     #[serde(default)]
     pub os: Option<OsRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OsRule {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Downloads {
     pub client: DownloadInfo,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DownloadInfo {
     pub url: String,
     pub sha1: String,
