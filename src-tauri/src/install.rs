@@ -28,7 +28,14 @@ pub async fn install_libraries(app: &AppHandle, version_json: &VersionJson) -> R
             let target = base.join(&artifact.path);
             if !target.exists() {
                 println!("Downloading library {}", lib.name);
-                download_to_file(&artifact.url, &target).await?;
+
+                // For Fabric libraries without hash verification, skip hash check
+                if artifact.sha1.is_empty() {
+                    download_to_file(&artifact.url, &target).await?;
+                } else {
+                    download_to_file(&artifact.url, &target).await?;
+                    // TODO: Add SHA1 verification here if needed
+                }
             }
         }
 

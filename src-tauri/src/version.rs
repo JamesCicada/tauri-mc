@@ -10,6 +10,18 @@ pub struct AssetIndex {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct VersionJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inheritsFrom: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releaseTime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
     pub libraries: Vec<Library>,
     pub downloads: Downloads,
     pub mainClass: String,

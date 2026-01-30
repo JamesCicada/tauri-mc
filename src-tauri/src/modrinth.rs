@@ -1,12 +1,9 @@
-use crate::commands::instance_dir;
-use crate::download::download_to_file;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use tauri::AppHandle;
-use tauri::Manager;
 
 const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 

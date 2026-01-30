@@ -21,14 +21,84 @@ pub struct LoaderInstalled {
 }
 
 pub fn fabric_installed(minecraft_root: &Path, mc_version: &str, loader_version: &str) -> bool {
-    let version_id = format!("fabric-{}-{}", mc_version, loader_version);
+    // The install_loader function creates derived version IDs in the format: fabric-loader-{loaderVersion}-{mcVersion}
+    let derived_version_id = format!("fabric-loader-{}-{}", loader_version, mc_version);
 
-    let version_json: PathBuf = minecraft_root
-        .join("versions")
-        .join(&version_id)
-        .join(format!("{}.json", version_id));
+    // Also check for alternative formats that might exist
+    let alt_version_id1 = format!("fabric-{}-{}", mc_version, loader_version);
+    let alt_version_id2 = format!("fabric-loader-{}-{}", mc_version, loader_version);
 
-    version_json.exists()
+    let versions_dir = minecraft_root.join("versions");
+
+    // Check for the primary derived version ID format
+    let version_json_primary: PathBuf = versions_dir
+        .join(&derived_version_id)
+        .join(format!("{}.json", derived_version_id));
+
+    // Check for alternative formats
+    let version_json_alt1: PathBuf = versions_dir
+        .join(&alt_version_id1)
+        .join(format!("{}.json", alt_version_id1));
+
+    let version_json_alt2: PathBuf = versions_dir
+        .join(&alt_version_id2)
+        .join(format!("{}.json", alt_version_id2));
+
+    let exists =
+        version_json_primary.exists() || version_json_alt1.exists() || version_json_alt2.exists();
+
+    if exists {
+        println!(
+            "fabric_installed: Found Fabric installation for MC {} loader {}",
+            mc_version, loader_version
+        );
+        if version_json_primary.exists() {
+            println!("  Found: {}", version_json_primary.display());
+        }
+        if version_json_alt1.exists() {
+            println!("  Found: {}", version_json_alt1.display());
+        }
+        if version_json_alt2.exists() {
+            println!("  Found: {}", version_json_alt2.display());
+        }
+    } else {
+        println!(
+            "fabric_installed: No Fabric installation found for MC {} loader {}",
+            mc_version, loader_version
+        );
+        println!("  Checked: {}", version_json_primary.display());
+        println!("  Checked: {}", version_json_alt1.display());
+        println!("  Checked: {}", version_json_alt2.display());
+
+        // Debug: List what versions actually exist
+        if versions_dir.exists() {
+            println!("  Available versions in {}:", versions_dir.display());
+            if let Ok(entries) = std::fs::read_dir(&versions_dir) {
+                let mut found_any = false;
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        println!("    - {}", name);
+                        found_any = true;
+                        if name.to_lowercase().contains("fabric") {
+                            println!("      ^ This contains 'fabric'");
+                        }
+                    }
+                }
+                if !found_any {
+                    println!("    (no versions found)");
+                }
+            } else {
+                println!("    (could not read versions directory)");
+            }
+        } else {
+            println!(
+                "  Versions directory {} does not exist!",
+                versions_dir.display()
+            );
+        }
+    }
+
+    exists
 }
 
 pub fn loader_verification(mc_dir: &std::path::Path, project_id: &str) -> bool {
@@ -38,20 +108,31 @@ pub fn loader_verification(mc_dir: &std::path::Path, project_id: &str) -> bool {
         mc_dir.display()
     );
 
-    // Heuristic checks: look for version folders or libraries that indicate Fabric/Quilt
+    let project_lower = project_id.to_lowercase();
+
+    // Check versions directory for loader-specific folders
     let versions_dir = mc_dir.join("versions");
     if versions_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&versions_dir) {
             for e in entries.flatten() {
                 if let Ok(name) = e.file_name().into_string() {
-                    let lname = name.to_lowercase();
-                    let pid = project_id.to_lowercase();
-                    if pid.contains("fabric") && lname.contains("fabric") {
+                    let name_lower = name.to_lowercase();
+
+                    // More specific matching for different loaders
+                    if project_lower.contains("fabric")
+                        && (name_lower.contains("fabric-loader") || name_lower.contains("fabric"))
+                    {
                         println!("loader_verification: found fabric version folder: {}", name);
                         return true;
                     }
-                    if pid.contains("quilt") && lname.contains("quilt") {
+                    if project_lower.contains("quilt")
+                        && (name_lower.contains("quilt-loader") || name_lower.contains("quilt"))
+                    {
                         println!("loader_verification: found quilt version folder: {}", name);
+                        return true;
+                    }
+                    if project_lower.contains("forge") && name_lower.contains("forge") {
+                        println!("loader_verification: found forge version folder: {}", name);
                         return true;
                     }
                 }
@@ -59,15 +140,18 @@ pub fn loader_verification(mc_dir: &std::path::Path, project_id: &str) -> bool {
         }
     }
 
+    // Check libraries directory for loader-specific libraries
     let libs = mc_dir.join("libraries");
     if libs.exists() {
-        let pid = project_id.to_lowercase();
+        let mut found_loader_libs = false;
         let mut stack: Vec<std::path::PathBuf> = Vec::new();
+
         if let Ok(entries) = std::fs::read_dir(&libs) {
             for e in entries.flatten() {
                 stack.push(e.path());
             }
         }
+
         while let Some(p) = stack.pop() {
             if p.is_dir() {
                 if let Ok(iter) = std::fs::read_dir(&p) {
@@ -76,16 +160,33 @@ pub fn loader_verification(mc_dir: &std::path::Path, project_id: &str) -> bool {
                     }
                 }
             } else if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                let lname = name.to_lowercase();
-                if pid.contains("fabric") && lname.contains("fabric") {
+                let name_lower = name.to_lowercase();
+
+                // Check for specific loader libraries
+                if project_lower.contains("fabric")
+                    && (name_lower.contains("fabric-loader") || name_lower.contains("fabric-api"))
+                {
                     println!("loader_verification: found fabric lib: {}", name);
-                    return true;
+                    found_loader_libs = true;
+                    break;
                 }
-                if pid.contains("quilt") && lname.contains("quilt") {
+                if project_lower.contains("quilt")
+                    && (name_lower.contains("quilt-loader") || name_lower.contains("quilt"))
+                {
                     println!("loader_verification: found quilt lib: {}", name);
-                    return true;
+                    found_loader_libs = true;
+                    break;
+                }
+                if project_lower.contains("forge") && name_lower.contains("forge") {
+                    println!("loader_verification: found forge lib: {}", name);
+                    found_loader_libs = true;
+                    break;
                 }
             }
+        }
+
+        if found_loader_libs {
+            return true;
         }
     }
 
