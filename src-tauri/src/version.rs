@@ -21,12 +21,16 @@ pub struct Library {
     pub name: String,
     pub downloads: LibraryDownloads,
     #[serde(default)]
+    pub natives: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub rules: Vec<Rule>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LibraryDownloads {
     pub artifact: Option<Artifact>,
+    #[serde(default)]
+    pub classifiers: std::collections::HashMap<String, Artifact>,
 }
 
 #[derive(Debug, Deserialize)]

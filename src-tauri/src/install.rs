@@ -6,7 +6,6 @@ use tauri::Manager;
 use crate::download::download_text;
 use crate::download::download_to_file;
 use crate::rules::rules_allow;
-use crate::version::Library;
 use crate::version::VersionJson;
 
 use crate::assets::{AssetIndexJson, AssetObject};
@@ -24,19 +23,33 @@ pub async fn install_libraries(app: &AppHandle, version_json: &VersionJson) -> R
             continue;
         }
 
-        let artifact = match &lib.downloads.artifact {
-            Some(a) => a,
-            None => continue,
-        };
-
-        let target = base.join(&artifact.path);
-
-        if target.exists() {
-            continue;
+        // 1. Download main artifact
+        if let Some(artifact) = &lib.downloads.artifact {
+            let target = base.join(&artifact.path);
+            if !target.exists() {
+                println!("Downloading library {}", lib.name);
+                download_to_file(&artifact.url, &target).await?;
+            }
         }
 
-        println!("Downloading library {}", lib.name);
-        download_to_file(&artifact.url, &target).await?;
+        // 2. Download natives if any
+        let os_key = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "osx"
+        } else {
+            "linux"
+        };
+
+        if let Some(classifier) = lib.natives.get(os_key) {
+            if let Some(artifact) = lib.downloads.classifiers.get(classifier) {
+                let target = base.join(&artifact.path);
+                if !target.exists() {
+                    println!("Downloading native library {} ({})", lib.name, classifier);
+                    download_to_file(&artifact.url, &target).await?;
+                }
+            }
+        }
     }
 
     Ok(())

@@ -13,9 +13,27 @@ pub fn build_classpath(app: &AppHandle, id: &str, version: &VersionJson) -> Resu
     let mut entries: Vec<PathBuf> = Vec::new();
 
     // Libraries
+    let os_key = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "osx"
+    } else {
+        "linux"
+    };
+
     for lib in &version.libraries {
+        if !crate::rules::rules_allow(&lib.rules) {
+            continue;
+        }
+
         if let Some(artifact) = &lib.downloads.artifact {
             entries.push(base.join("libraries").join(&artifact.path));
+        }
+
+        if let Some(classifier) = lib.natives.get(os_key) {
+            if let Some(artifact) = lib.downloads.classifiers.get(classifier) {
+                entries.push(base.join("libraries").join(&artifact.path));
+            }
         }
     }
 

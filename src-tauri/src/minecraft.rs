@@ -27,3 +27,8 @@ pub struct ManifestVersion {
     pub version_type: String,
     pub url: String,
 }
+pub async fn get_manifest() -> Result<VersionManifest, String> {
+    let url = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
+    let text = crate::download::download_text(url).await?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
