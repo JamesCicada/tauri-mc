@@ -1,27 +1,32 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 import type {
-  McVersion,
-  VersionManifest,
   Instance,
   Settings,
   ModrinthSearchResult,
   ModrinthProjectHit,
   ModrinthVersion,
   LoaderCandidate,
+  ModFileEntry,
+  ScreenshotEntry,
+  WorldEntry,
+  ServerEntry,
 } from "./types/types";
 import {
-  PlayIcon,
-  SettingsIcon,
-  StopCircleIcon,
-  TerminalIcon,
-  PackageIcon,
   SearchIcon,
-  DownloadIcon,
+  PlusIcon,
+  FolderOpenIcon,
+  ImageIcon,
+  GlobeIcon,
+  ServerIcon,
+  Trash2Icon,
 } from "lucide-react";
+import InstancesPage from "./components/InstancesPage";
+import NewInstanceModal from "./components/NewInstanceModal";
+import ModVersionPickerModal from "./components/ModVersionPickerModal";
 
 interface JavaCompatibility {
   compatible: boolean;
@@ -32,7 +37,7 @@ interface JavaCompatibility {
 
 /* -------------------- Types -------------------- */
 
-type Page = "instances" | "versions" | "settings" | "modpacks";
+type Page = "instances" | "settings";
 
 /* -------------------- Components -------------------- */
 
@@ -44,14 +49,6 @@ const NavIcon = ({ name }: { name: string }) => {
           <path d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z" />
         </svg>
       );
-    case "versions":
-      return (
-        <svg viewBox="0 0 24 24" className="nav-icon">
-          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
-        </svg>
-      );
-    case "modpacks":
-      return <PackageIcon className="nav-icon" size={18} />;
     case "settings":
       return (
         <svg viewBox="0 0 24 24" className="nav-icon">
@@ -68,11 +65,8 @@ const NavIcon = ({ name }: { name: string }) => {
 
 function App() {
   const [page, setPage] = useState<Page>("instances");
-  const [manifest, setManifest] = useState<VersionManifest | null>(null);
   const [instances, setInstances] = useState<Instance[]>([]);
-  const [filter, setFilter] = useState<
-    "release" | "snapshot" | "old_alpha" | "old_beta" | "all"
-  >("release");
+  const [newInstanceModalOpen, setNewInstanceModalOpen] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<{
     instanceId: string;
     instanceName: string;
@@ -95,12 +89,13 @@ function App() {
     { id: number; message: string; type: "success" | "error" }[]
   >([]);
   const [settingsTab, setSettingsTab] = useState<
-    "general" | "mods" | "screenshots"
+    "general" | "mods" | "screenshots" | "worlds" | "servers"
   >("general");
-  const [modpackQuery, setModpackQuery] = useState("");
-  const [modpackResults, setModpackResults] =
-    useState<ModrinthSearchResult | null>(null);
-  const [modpackLoading, setModpackLoading] = useState(false);
+  const [installedMods, setInstalledMods] = useState<ModFileEntry[]>([]);
+  const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
+  const [worlds, setWorlds] = useState<WorldEntry[]>([]);
+  const [servers, setServers] = useState<ServerEntry[]>([]);
+  const [addModModalOpen, setAddModModalOpen] = useState(false);
   const [installingModpack, setInstallingModpack] = useState<{
     project: ModrinthProjectHit;
     versionId: string;
@@ -110,6 +105,10 @@ function App() {
   const [modSearchResults, setModSearchResults] =
     useState<ModrinthSearchResult | null>(null);
   const [modSearchLoading, setModSearchLoading] = useState(false);
+  const [modVersionPicker, setModVersionPicker] = useState<{
+    hit: ModrinthProjectHit;
+    versions: ModrinthVersion[];
+  } | null>(null);
 
   const [loaderCandidates, setLoaderCandidates] = useState<{
     instanceId: string;
@@ -137,10 +136,6 @@ function App() {
   );
 
   useEffect(() => {
-    invoke<VersionManifest>("get_version_manifest")
-      .then(setManifest)
-      .catch(console.error);
-
     invoke<Instance[]>("list_instances")
       .then(setInstances)
       .catch(console.error);
@@ -201,34 +196,42 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // When opening instance settings -> Mods, show popular mods if no search was performed
-    if (instanceSettingsModal && settingsTab === "mods" && !modSearchResults) {
-      invoke<ModrinthSearchResult>("get_popular_mods", { limit: 20 })
-        .then((res) => setModSearchResults(res))
+    if (!instanceSettingsModal) return;
+    if (settingsTab === "mods") {
+      invoke<ModFileEntry[]>("list_instance_mods", {
+        instanceId: instanceSettingsModal.id,
+      })
+        .then(setInstalledMods)
+        .catch((e) => addToast(String(e), "error"));
+    } else if (settingsTab === "screenshots") {
+      invoke<ScreenshotEntry[]>("list_instance_screenshots", {
+        instanceId: instanceSettingsModal.id,
+      })
+        .then(setScreenshots)
+        .catch((e) => addToast(String(e), "error"));
+    } else if (settingsTab === "worlds") {
+      invoke<WorldEntry[]>("list_instance_worlds", {
+        instanceId: instanceSettingsModal.id,
+      })
+        .then(setWorlds)
+        .catch((e) => addToast(String(e), "error"));
+    } else if (settingsTab === "servers") {
+      invoke<ServerEntry[]>("list_instance_servers", {
+        instanceId: instanceSettingsModal.id,
+      })
+        .then(setServers)
         .catch((e) => addToast(String(e), "error"));
     }
   }, [instanceSettingsModal, settingsTab]);
 
-  const filteredVersions = useMemo(() => {
-    if (!manifest) return [];
-    if (filter === "all") return manifest.versions;
-    return manifest.versions.filter((v: McVersion) => v.type === filter);
-  }, [manifest, filter]);
-
-  const createInstance = useCallback(async (version: McVersion) => {
-    try {
-      const instanceId = await invoke<string>("create_instance", {
-        name: `Minecraft ${version.id}`,
-        version: version.id,
-      });
-      setInstances(await invoke<Instance[]>("list_instances"));
-      await invoke("download_version", { instanceId, versionId: version.id });
-      setInstances(await invoke<Instance[]>("list_instances"));
-    } catch (e) {
-      console.error(e);
-      setInstances(await invoke<Instance[]>("list_instances"));
+  useEffect(() => {
+    // When opening Add Mod modal, show popular mods if no search was performed
+    if (addModModalOpen && instanceSettingsModal && !modSearchResults) {
+      invoke<ModrinthSearchResult>("get_popular_mods", { limit: 20 })
+        .then((res) => setModSearchResults(res))
+        .catch((e) => addToast(String(e), "error"));
     }
-  }, []);
+  }, [addModModalOpen, instanceSettingsModal]);
 
   const launchAction = useCallback(
     (instanceId: string) => {
@@ -311,22 +314,6 @@ function App() {
     [settings],
   );
 
-  const searchModpacks = useCallback(async () => {
-    if (!modpackQuery) return;
-    setModpackLoading(true);
-    try {
-      const results = await invoke<ModrinthSearchResult>("search_projects", {
-        query: modpackQuery,
-        projectType: "modpack",
-      });
-      setModpackResults(results);
-    } catch (e) {
-      addToast(String(e), "error");
-    } finally {
-      setModpackLoading(false);
-    }
-  }, [modpackQuery, addToast]);
-
   const searchMods = useCallback(async () => {
     if (!modSearchQuery) return;
     setModSearchLoading(true);
@@ -349,24 +336,14 @@ function App() {
         <div className="sidebar-header">MC Launcher</div>
         <nav className="nav-list">
           <button
+            type="button"
             className={`nav-item ${page === "instances" ? "active" : ""}`}
             onClick={() => setPage("instances")}
           >
             <NavIcon name="instances" /> Instances
           </button>
           <button
-            className={`nav-item ${page === "versions" ? "active" : ""}`}
-            onClick={() => setPage("versions")}
-          >
-            <NavIcon name="versions" /> Versions
-          </button>
-          <button
-            className={`nav-item ${page === "modpacks" ? "active" : ""}`}
-            onClick={() => setPage("modpacks")}
-          >
-            <NavIcon name="modpacks" /> Modpacks
-          </button>
-          <button
+            type="button"
             className={`nav-item ${page === "settings" ? "active" : ""}`}
             onClick={() => setPage("settings")}
           >
@@ -378,238 +355,37 @@ function App() {
       <main className="main-content">
         <div className="page-container">
           {page === "instances" && (
-            <section>
-              <header className="page-header">
-                <h1 className="page-title">Instances</h1>
-              </header>
-              {instances.length === 0 ? (
-                <p style={{ color: "var(--text-secondary)" }}>
-                  No instances available. Go to Versions to create one.
-                </p>
-              ) : (
-                <div className="instances-grid">
-                  {instances.map((inst) => (
-                    <div key={inst.id} className="instance-card">
-                      <div className="instance-header">
-                        <div style={{ flex: 1 }}>
-                          <p className="instance-name">{inst.name}</p>
-                          <p className="instance-version">
-                            {inst.version}
-                            {inst.loader
-                              ? ` • ${inst.loader}${inst.loader_version ? ` ${inst.loader_version}` : ""}`
-                              : ""}
-                          </p>
-                        </div>
-                        <div
-                          style={{
-                            display: "flex",
-                            flexDirection: "column",
-                            alignItems: "flex-end",
-                            gap: 8,
-                          }}
-                        >
-                          <span className={`badge badge-${inst.state}`}>
-                            {inst.state}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div
-                        className="instance-actions"
-                        style={{
-                          padding: "12px 0 0 0",
-                          borderTop: "1px solid rgba(255,255,255,0.05)",
-                          marginTop: 12,
-                          justifyContent: "flex-start",
-                        }}
-                      >
-                        <button
-                          className="btn-transparent"
-                          onClick={() => playInstance(inst)}
-                          title={inst.state === "running" ? "Kill" : "Play"}
-                          style={{ marginRight: 4 }}
-                        >
-                          {inst.state === "running" ? (
-                            <StopCircleIcon
-                              color="#ff5252"
-                              size={20}
-                              strokeWidth={2.5}
-                            />
-                          ) : (
-                            <PlayIcon
-                              color="#00c853"
-                              size={20}
-                              strokeWidth={2.5}
-                              fill="#00c853"
-                            />
-                          )}
-                        </button>
-
-                        <button
-                          className="btn-transparent"
-                          onClick={() => setConsoleInstance(inst)}
-                          title="View Logs"
-                        >
-                          <TerminalIcon
-                            color="var(--text-secondary)"
-                            size={18}
-                          />
-                        </button>
-
-                        <button
-                          className="btn-transparent"
-                          onClick={() => setInstanceSettingsModal(inst)}
-                          title="Manage"
-                        >
-                          <SettingsIcon
-                            color="var(--text-secondary)"
-                            size={18}
-                          />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
+            <InstancesPage
+              instances={instances}
+              onOpenNewInstance={() => setNewInstanceModalOpen(true)}
+              onPlay={playInstance}
+              onLogs={setConsoleInstance}
+              onSettings={setInstanceSettingsModal}
+            />
           )}
 
-          {page === "versions" && (
-            <section>
-              <header className="page-header">
-                <h1 className="page-title">Minecraft Versions</h1>
-              </header>
-              <div className="filter-bar">
-                {(
-                  [
-                    "release",
-                    "snapshot",
-                    "old_alpha",
-                    "old_beta",
-                    "all",
-                  ] as const
-                ).map((t) => (
-                  <button
-                    key={t}
-                    className={`btn filter-btn ${filter === t ? "active" : ""}`}
-                    onClick={() => setFilter(t)}
-                  >
-                    {t.replace("_", " ")}
-                  </button>
-                ))}
-              </div>
-              {!manifest ? (
-                <p>Connecting to Mojang...</p>
-              ) : (
-                <div className="version-list">
-                  {filteredVersions.map((v) => (
-                    <div key={v.id} className="version-row">
-                      <span className="version-id">Minecraft {v.id}</span>
-                      <span className="version-type">{v.type}</span>
-                      <button className="btn" onClick={() => createInstance(v)}>
-                        Create Instance
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          )}
-
-          {page === "modpacks" && (
-            <section>
-              <header className="page-header">
-                <h1 className="page-title">Browse Modpacks</h1>
-                <p style={{ color: "var(--text-secondary)" }}>
-                  Discover and install modpacks from Modrinth
-                </p>
-              </header>
-
-              <div className="search-container">
-                <input
-                  type="text"
-                  className="search-input"
-                  placeholder="Search modpacks (e.g. Better MC, Fabulously Optimized)..."
-                  value={modpackQuery}
-                  onChange={(e) => setModpackQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && searchModpacks()}
-                />
-                <button
-                  className="btn btn-primary"
-                  onClick={searchModpacks}
-                  disabled={modpackLoading}
-                >
-                  {modpackLoading ? (
-                    "Searching..."
-                  ) : (
-                    <>
-                      <SearchIcon size={18} /> Search
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {modpackResults && (
-                <div className="modpack-grid">
-                  {modpackResults.hits.map((hit) => (
-                    <div key={hit.project_id} className="modpack-card">
-                      <div className="modpack-info">
-                        <img
-                          src={
-                            hit.icon_url ||
-                            "https://cdn.modrinth.com/placeholder.svg"
-                          }
-                          className="modpack-icon"
-                          alt={hit.title}
-                        />
-                        <div className="modpack-details">
-                          <h3 className="modpack-title">{hit.title}</h3>
-                          <p className="modpack-author">by {hit.author}</p>
-                        </div>
-                      </div>
-                      <p className="modpack-description">{hit.description}</p>
-                      <button
-                        className="btn btn-primary"
-                        style={{
-                          marginTop: "auto",
-                          width: "100%",
-                          gap: 8,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                        onClick={async () => {
-                          try {
-                            const versions = await invoke<ModrinthVersion[]>(
-                              "get_project_versions",
-                              { projectId: hit.project_id },
-                            );
-                            const latest = versions[0]; // Simple logic for now
-                            if (latest) {
-                              setInstallingModpack({
-                                project: hit,
-                                versionId: latest.id,
-                              });
-                              setNewModpackName(hit.title);
-                              if (latest.loaders && latest.loaders.length > 0) {
-                                addToast(
-                                  `Modpack requires loader: ${latest.loaders[0]}. Automatic loader installation is not implemented.`,
-                                  "error",
-                                );
-                              }
-                            }
-                          } catch (e) {
-                            addToast(String(e), "error");
-                          }
-                        }}
-                      >
-                        <DownloadIcon size={16} /> Install Modpack
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
+          {newInstanceModalOpen && (
+            <NewInstanceModal
+              open={newInstanceModalOpen}
+              onClose={() => setNewInstanceModalOpen(false)}
+              onCreateFromVersion={async (version) => {
+                const instanceId = await invoke<string>("create_instance", {
+                  name: `Minecraft ${version.id}`,
+                  version: version.id,
+                });
+                setInstances(await invoke<Instance[]>("list_instances"));
+                await invoke("download_version", {
+                  instanceId,
+                  versionId: version.id,
+                });
+                setInstances(await invoke<Instance[]>("list_instances"));
+              }}
+              onSelectModpack={(project, versionId) => {
+                setInstallingModpack({ project, versionId });
+                setNewModpackName(project.title);
+              }}
+              addToast={addToast}
+            />
           )}
 
           {page === "settings" && settings && (
@@ -711,6 +487,18 @@ function App() {
                 onClick={() => setSettingsTab("screenshots")}
               >
                 Screenshots
+              </div>
+              <div
+                className={`tab-item ${settingsTab === "worlds" ? "active" : ""}`}
+                onClick={() => setSettingsTab("worlds")}
+              >
+                Worlds
+              </div>
+              <div
+                className={`tab-item ${settingsTab === "servers" ? "active" : ""}`}
+                onClick={() => setSettingsTab("servers")}
+              >
+                Servers
               </div>
             </div>
 
@@ -853,152 +641,458 @@ function App() {
               {settingsTab === "mods" && (
                 <div style={{ padding: 16 }}>
                   <div
-                    className="search-container"
-                    style={{ marginBottom: 16 }}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 16,
+                    }}
                   >
-                    <input
-                      type="text"
-                      className="search-input"
-                      placeholder="Search mods on Modrinth..."
-                      value={modSearchQuery}
-                      onChange={(e) => setModSearchQuery(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && searchMods()}
-                      style={{ padding: "8px 12px", fontSize: "0.9rem" }}
-                    />
-                    <button
-                      className="btn btn-primary"
-                      onClick={searchMods}
-                      disabled={modSearchLoading}
-                      style={{ padding: "8px 16px" }}
-                    >
-                      {modSearchLoading ? "..." : <SearchIcon size={16} />}
-                    </button>
-                  </div>
-
-                  {modSearchResults ? (
-                    <>
-                      <div
-                        style={{
-                          fontSize: "0.85rem",
-                          color: "var(--text-secondary)",
-                          marginBottom: 8,
-                        }}
-                      >
-                        {modSearchQuery ? "Search results" : "Popular Mods"}
-                      </div>
-                      <div className="mod-search-results">
-                        {modSearchResults.hits.map((hit) => (
-                          <div key={hit.project_id} className="mod-result-item">
-                            <div
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                gap: 12,
-                              }}
-                            >
-                              <img
-                                src={
-                                  hit.icon_url ||
-                                  "https://cdn.modrinth.com/placeholder.svg"
-                                }
-                                style={{
-                                  width: 32,
-                                  height: 32,
-                                  borderRadius: 4,
-                                }}
-                                alt=""
-                              />
-                              <div>
-                                <div
-                                  style={{
-                                    fontWeight: 600,
-                                    fontSize: "0.9rem",
-                                  }}
-                                >
-                                  {hit.title}
-                                </div>
-                                <div
-                                  style={{
-                                    fontSize: "0.75rem",
-                                    color: "var(--text-secondary)",
-                                  }}
-                                >
-                                  {hit.author}
-                                </div>
-                              </div>
-                            </div>
-                            <button
-                              className="btn btn-secondary"
-                              style={{
-                                padding: "4px 10px",
-                                fontSize: "0.8rem",
-                              }}
-                              onClick={async () => {
-                                try {
-                                  const versions = await invoke<
-                                    ModrinthVersion[]
-                                  >("get_project_versions", {
-                                    projectId: hit.project_id,
-                                  });
-                                  // Simple logic: pick first version that matches instance version
-                                  const compatible = versions.find((v) =>
-                                    v.game_versions.includes(
-                                      instanceSettingsModal.version,
-                                    ),
-                                  );
-                                  if (compatible) {
-                                    addToast(
-                                      `Installing ${hit.title}...`,
-                                      "success",
-                                    );
-                                    await invoke("install_modrinth_mod", {
-                                      instanceId: instanceSettingsModal.id,
-                                      versionId: compatible.id,
-                                    });
-                                    addToast(
-                                      `${hit.title} installed!`,
-                                      "success",
-                                    );
-                                  } else {
-                                    addToast(
-                                      "No compatible version found for MC " +
-                                      instanceSettingsModal.version,
-                                      "error",
-                                    );
-                                  }
-                                } catch (e) {
-                                  addToast(String(e), "error");
-                                }
-                              }}
-                            >
-                              Add
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </>
-                  ) : (
-                    <div
+                    <span
                       style={{
-                        padding: "40px 0",
-                        textAlign: "center",
+                        fontSize: "0.9rem",
                         color: "var(--text-secondary)",
                       }}
                     >
-                      Search for mods to add to this instance
-                    </div>
-                  )}
+                      {installedMods.length} mod
+                      {installedMods.length !== 1 ? "s" : ""} installed
+                    </span>
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => setAddModModalOpen(true)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "8px 14px",
+                      }}
+                    >
+                      <PlusIcon size={18} /> Add mod
+                    </button>
+                  </div>
+                  <div
+                    className="mod-search-results"
+                    style={{
+                      maxHeight: 280,
+                      minHeight: 80,
+                    }}
+                  >
+                    {installedMods.length === 0 ? (
+                      <div
+                        style={{
+                          padding: 24,
+                          textAlign: "center",
+                          color: "var(--text-secondary)",
+                          fontSize: "0.9rem",
+                        }}
+                      >
+                        No mods installed. Click &quot;Add mod&quot; to browse
+                        Modrinth.
+                      </div>
+                    ) : (
+                      installedMods.map((mod) => (
+                        <div
+                          key={mod.name}
+                          className="mod-result-item"
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                          }}
+                        >
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              style={{
+                                fontWeight: 600,
+                                fontSize: "0.9rem",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {mod.name}
+                            </div>
+                            <div
+                              style={{
+                                fontSize: "0.75rem",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              {(mod.size_bytes / 1024).toFixed(1)} KB
+                            </div>
+                          </div>
+                          <button
+                            className="btn btn-transparent"
+                            title="Remove mod"
+                            onClick={async () => {
+                              if (!instanceSettingsModal) return;
+                              try {
+                                await invoke("remove_mod", {
+                                  instanceId: instanceSettingsModal.id,
+                                  filename: mod.name,
+                                });
+                                setInstalledMods((prev) =>
+                                  prev.filter((m) => m.name !== mod.name),
+                                );
+                                addToast(`Removed ${mod.name}`, "success");
+                              } catch (e) {
+                                addToast(String(e), "error");
+                              }
+                            }}
+                            style={{ color: "var(--error-color)" }}
+                          >
+                            <Trash2Icon size={16} />
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
               )}
               {settingsTab === "screenshots" && (
-                <div
-                  style={{
-                    padding: "40px 20px",
-                    textAlign: "center",
-                    color: "var(--text-secondary)",
-                  }}
-                >
-                  Screenshots viewer coming soon...
+                <div style={{ padding: 16 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 16,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: "0.9rem",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      {screenshots.length} screenshot
+                      {screenshots.length !== 1 ? "s" : ""}
+                    </span>
+                    {instanceSettingsModal && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                          try {
+                            const screenshotsDir = await invoke<string>(
+                              "get_instance_screenshots_dir",
+                              {
+                                instanceId: instanceSettingsModal.id,
+                              },
+                            );
+                            await invoke("open_path", { path: screenshotsDir });
+                          } catch (e) {
+                            addToast(String(e), "error");
+                          }
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "8px 14px",
+                        }}
+                      >
+                        <FolderOpenIcon size={16} /> Open folder
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className="mod-search-results"
+                    style={{
+                      maxHeight: 320,
+                      minHeight: 80,
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
+                      gap: 12,
+                      padding: 12,
+                    }}
+                  >
+                    {screenshots.length === 0 ? (
+                      <div
+                        style={{
+                          gridColumn: "1 / -1",
+                          padding: 24,
+                          textAlign: "center",
+                          color: "var(--text-secondary)",
+                          fontSize: "0.9rem",
+                        }}
+                      >
+                        No screenshots yet. Take some in-game (F2).
+                      </div>
+                    ) : (
+                      screenshots.map((s) => (
+                        <button
+                          key={s.name}
+                          className="btn-transparent"
+                          onClick={() => invoke("open_path", { path: s.path })}
+                          style={{
+                            flexDirection: "column",
+                            alignItems: "stretch",
+                            padding: 8,
+                            border: "1px solid var(--border-color)",
+                            borderRadius: 8,
+                            overflow: "hidden",
+                          }}
+                        >
+                          <div
+                            style={{
+                              aspectRatio: "16/9",
+                              background: "var(--bg-primary)",
+                              borderRadius: 4,
+                              marginBottom: 8,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                            }}
+                          >
+                            <ImageIcon
+                              size={32}
+                              color="var(--text-secondary)"
+                            />
+                          </div>
+                          <span
+                            style={{
+                              fontSize: "0.75rem",
+                              color: "var(--text-secondary)",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              textAlign: "left",
+                            }}
+                          >
+                            {s.name}
+                          </span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+              {settingsTab === "worlds" && (
+                <div style={{ padding: 16 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 16,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: "0.9rem",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      {worlds.length} world{worlds.length !== 1 ? "s" : ""}
+                    </span>
+                    {instanceSettingsModal && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                          try {
+                            const savesDir = await invoke<string>(
+                              "get_instance_saves_dir",
+                              {
+                                instanceId: instanceSettingsModal.id,
+                              },
+                            );
+                            await invoke("open_path", { path: savesDir });
+                          } catch (e) {
+                            addToast(String(e), "error");
+                          }
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "8px 14px",
+                        }}
+                      >
+                        <FolderOpenIcon size={16} /> Open saves folder
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className="mod-search-results"
+                    style={{
+                      maxHeight: 280,
+                      minHeight: 80,
+                    }}
+                  >
+                    {worlds.length === 0 ? (
+                      <div
+                        style={{
+                          padding: 24,
+                          textAlign: "center",
+                          color: "var(--text-secondary)",
+                          fontSize: "0.9rem",
+                        }}
+                      >
+                        No worlds yet. Create one in-game.
+                      </div>
+                    ) : (
+                      worlds.map((w) => (
+                        <div
+                          key={w.folder}
+                          className="mod-result-item"
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 12,
+                            }}
+                          >
+                            <GlobeIcon
+                              size={24}
+                              color="var(--text-secondary)"
+                            />
+                            <div>
+                              <div
+                                style={{
+                                  fontWeight: 600,
+                                  fontSize: "0.9rem",
+                                }}
+                              >
+                                {w.name}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: "0.75rem",
+                                  color: "var(--text-secondary)",
+                                }}
+                              >
+                                {w.folder}
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ padding: "6px 12px", fontSize: "0.8rem" }}
+                            onClick={() => invoke("open_path", { path: w.path })}
+                          >
+                            Open folder
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+              {settingsTab === "servers" && (
+                <div style={{ padding: 16 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 16,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: "0.9rem",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      Saved servers (in-game)
+                    </span>
+                    {instanceSettingsModal && (
+                      <button
+                        className="btn btn-secondary"
+                        onClick={async () => {
+                          try {
+                            const dir = await invoke<string>(
+                              "get_instance_minecraft_dir",
+                              {
+                                instanceId: instanceSettingsModal.id,
+                              },
+                            );
+                            await invoke("open_path", { path: dir });
+                          } catch (e) {
+                            addToast(String(e), "error");
+                          }
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "8px 14px",
+                        }}
+                      >
+                        <FolderOpenIcon size={16} /> Open .minecraft folder
+                      </button>
+                    )}
+                  </div>
+                  <div
+                    className="mod-search-results"
+                    style={{
+                      maxHeight: 280,
+                      minHeight: 80,
+                    }}
+                  >
+                    {servers.length === 0 ? (
+                      <div
+                        style={{
+                          padding: 24,
+                          textAlign: "center",
+                          color: "var(--text-secondary)",
+                          fontSize: "0.9rem",
+                        }}
+                      >
+                        No servers listed. Add servers in-game, or open the
+                        .minecraft folder to edit servers.dat.
+                      </div>
+                    ) : (
+                      servers.map((s, i) => (
+                        <div
+                          key={i}
+                          className="mod-result-item"
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 12,
+                            }}
+                          >
+                            <ServerIcon
+                              size={24}
+                              color="var(--text-secondary)"
+                            />
+                            <div>
+                              <div
+                                style={{
+                                  fontWeight: 600,
+                                  fontSize: "0.9rem",
+                                }}
+                              >
+                                {s.name}
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: "0.75rem",
+                                  color: "var(--text-secondary)",
+                                }}
+                              >
+                                {s.ip}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -1060,6 +1154,197 @@ function App() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {addModModalOpen && instanceSettingsModal && (
+        <div
+          className="dialog-overlay"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setAddModModalOpen(false);
+          }}
+        >
+          <div
+            className="dialog-modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: 520, width: "90%" }}
+          >
+            <h2 className="dialog-title">Add mod from Modrinth</h2>
+            <div
+              className="search-container"
+              style={{ marginBottom: 16 }}
+            >
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search mods..."
+                value={modSearchQuery}
+                onChange={(e) => setModSearchQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && searchMods()}
+                style={{ padding: "8px 12px", fontSize: "0.9rem" }}
+              />
+              <button
+                className="btn btn-primary"
+                onClick={searchMods}
+                disabled={modSearchLoading}
+                style={{ padding: "8px 16px" }}
+              >
+                {modSearchLoading ? "..." : <SearchIcon size={16} />}
+              </button>
+            </div>
+            <div
+              style={{
+                fontSize: "0.85rem",
+                color: "var(--text-secondary)",
+                marginBottom: 8,
+              }}
+            >
+              {modSearchResults
+                ? modSearchQuery
+                  ? "Search results"
+                  : "Popular Mods"
+                : "Search to find mods"}
+            </div>
+            <div
+              className="mod-search-results"
+              style={{
+                maxHeight: 280,
+                marginBottom: 16,
+              }}
+            >
+              {modSearchResults?.hits.map((hit: ModrinthProjectHit) => (
+                <div key={hit.project_id} className="mod-result-item">
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 12,
+                    }}
+                  >
+                    <img
+                      src={
+                        hit.icon_url ||
+                        "https://cdn.modrinth.com/placeholder.svg"
+                      }
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: 4,
+                      }}
+                      alt=""
+                    />
+                    <div>
+                      <div
+                        style={{
+                          fontWeight: 600,
+                          fontSize: "0.9rem",
+                        }}
+                      >
+                        {hit.title}
+                      </div>
+                      <div
+                        style={{
+                          fontSize: "0.75rem",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {hit.author}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-secondary"
+                    style={{
+                      padding: "4px 10px",
+                      fontSize: "0.8rem",
+                    }}
+                    onClick={async () => {
+                      try {
+                        const versions = await invoke<ModrinthVersion[]>(
+                          "get_compatible_mod_versions",
+                          {
+                            instanceId: instanceSettingsModal.id,
+                            projectId: hit.project_id,
+                          },
+                        );
+                        if (versions.length === 0) {
+                          addToast(
+                            "No compatible version for this instance",
+                            "error",
+                          );
+                          return;
+                        }
+                        setModVersionPicker({ hit, versions });
+                      } catch (e) {
+                        addToast(String(e), "error");
+                      }
+                    }}
+                  >
+                    Add
+                  </button>
+                </div>
+              )) ?? (
+                  <div
+                    style={{
+                      padding: 24,
+                      textAlign: "center",
+                      color: "var(--text-secondary)",
+                      fontSize: "0.9rem",
+                    }}
+                  >
+                    Search for mods to add
+                  </div>
+                )}
+            </div>
+            <div className="dialog-actions" style={{ justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  setAddModModalOpen(false);
+                  setModSearchResults(null);
+                  setModSearchQuery("");
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modVersionPicker && instanceSettingsModal && (
+        <div
+          className="dialog-overlay"
+          onClick={() => setModVersionPicker(null)}
+        >
+          <ModVersionPickerModal
+            hit={modVersionPicker.hit}
+            versions={modVersionPicker.versions}
+            onInstall={async (versionId: string) => {
+              try {
+                addToast(
+                  `Installing ${modVersionPicker.hit.title}...`,
+                  "success",
+                );
+                await invoke("install_modrinth_mod", {
+                  instanceId: instanceSettingsModal.id,
+                  projectId: modVersionPicker.hit.project_id,
+                  versionId,
+                });
+                addToast(`${modVersionPicker.hit.title} installed!`, "success");
+                setModVersionPicker(null);
+                setAddModModalOpen(false);
+                const mods = await invoke<ModFileEntry[]>(
+                  "list_instance_mods",
+                  { instanceId: instanceSettingsModal.id },
+                );
+                setInstalledMods(mods);
+              } catch (e) {
+                addToast(String(e), "error");
+              }
+            }}
+            onCancel={() => setModVersionPicker(null)}
+          />
         </div>
       )}
 

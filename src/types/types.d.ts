@@ -88,3 +88,25 @@ export interface ModrinthFile {
     primary: boolean;
     size: number;
 }
+
+export interface ModFileEntry {
+    name: string;
+    size_bytes: number;
+}
+
+export interface ScreenshotEntry {
+    name: string;
+    path: string;
+}
+
+export interface WorldEntry {
+    name: string;
+    folder: string;
+    path: string;
+}
+
+export interface ServerEntry {
+    name: string;
+    ip: string;
+    icon?: string;
+}

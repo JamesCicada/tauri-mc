@@ -11,7 +11,7 @@ use crate::java::ensure_java;
 use crate::launch::build_classpath;
 use crate::minecraft::get_manifest;
 use crate::version::VersionJson;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 // Helper function to convert Maven coordinates to file path
@@ -60,8 +60,72 @@ fn instances_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Sanitize a display name for use as a folder name (no path separators or invalid chars).
+fn sanitize_folder_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    s.trim().to_string().trim_end_matches('.').to_string()
+}
+
+/// Return a unique folder name: base_name or "base_name (2)", "base_name (3)", etc.
+fn unique_instance_folder_name(app: &AppHandle, base_name: &str) -> Result<String, String> {
+    let base = if base_name.is_empty() {
+        "Instance".to_string()
+    } else {
+        sanitize_folder_name(base_name)
+    };
+    let root = instances_root(app)?;
+    let existing: HashSet<String> = if root.exists() {
+        fs::read_dir(root)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    if !existing.contains(&base) {
+        return Ok(base);
+    }
+    for n in 2..=9999 {
+        let candidate = format!("{} ({})", base, n);
+        if !existing.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not generate unique instance folder name".to_string())
+}
+
+/// Resolve instance id (uuid) to folder path by scanning instance.json files.
 pub fn instance_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
-    Ok(instances_root(app)?.join(id))
+    let root = instances_root(app)?;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("instance.json");
+            if meta_path.exists() {
+                if let Ok(text) = fs::read_to_string(&meta_path) {
+                    if let Ok(instance) = serde_json::from_str::<Instance>(&text) {
+                        if instance.id == id {
+                            std::println!("Checking instance at {:?}", entry.path());
+                            return Ok(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(format!("Instance not found: {}", id))
 }
 
 pub fn instance_meta_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
@@ -102,13 +166,15 @@ pub async fn create_instance(
     version: String,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let dir = instance_dir(&app, &id)?;
+    let folder_name = unique_instance_folder_name(&app, &name)?;
+    let root = instances_root(&app)?;
+    let dir = root.join(&folder_name);
 
     fs::create_dir_all(dir.join(".minecraft")).map_err(|e| e.to_string())?;
 
     let instance = Instance {
-        id,
-        name,
+        id: id.clone(),
+        name: name.clone(),
         version: version.clone(),
         mc_version: Some(version.clone()),
         state: InstanceState::Installing,
@@ -124,8 +190,9 @@ pub async fn create_instance(
         loader_version: None,
     };
 
+    let meta_path = dir.join("instance.json");
     fs::write(
-        instance_meta_path(&app, &instance.id)?,
+        &meta_path,
         serde_json::to_string_pretty(&instance).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
@@ -901,6 +968,9 @@ pub async fn launch_instance(
         .arg("--assetIndex")
         .arg(&version.assetIndex.id);
 
+    // Run game with CWD = game dir so mods (e.g. Crash Assistant) write config to instance/.minecraft/config/, not project folder
+    command.current_dir(&game_dir);
+
     // Capture logs
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1111,13 +1181,41 @@ pub async fn get_project_versions(
     crate::modrinth::get_project_versions(&project_id).await
 }
 
+/// List mod versions compatible with the instance's Minecraft version and loader (for version picker).
+#[tauri::command]
+pub async fn get_compatible_mod_versions(
+    app: AppHandle,
+    instance_id: String,
+    project_id: String,
+) -> Result<Vec<crate::modrinth::ModrinthVersion>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let meta_text = fs::read_to_string(root.join("instance.json")).map_err(|e| e.to_string())?;
+    let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
+
+    let mc_version = instance
+        .mc_version
+        .as_deref()
+        .unwrap_or(instance.version.as_str());
+    let loader_str = instance.loader.as_deref().unwrap_or("fabric");
+
+    let loader = match loader_str.to_lowercase().as_str() {
+        "fabric" => crate::modrinth::ModLoader::Fabric,
+        "quilt" => crate::modrinth::ModLoader::Quilt,
+        "forge" => crate::modrinth::ModLoader::Forge,
+        "neoforge" => crate::modrinth::ModLoader::NeoForge,
+        _ => crate::modrinth::ModLoader::Fabric,
+    };
+
+    crate::modrinth::list_compatible_versions(&project_id, mc_version, loader).await
+}
+
 #[tauri::command]
 pub async fn get_popular_mods(
     _app: AppHandle,
     limit: Option<u8>,
 ) -> Result<crate::modrinth::ModrinthSearchResult, String> {
     let l = limit.unwrap_or(20) as usize;
-    crate::modrinth::search_popular_mods(l).await
+    crate::modrinth::get_popular_mods(l).await
 }
 
 // Loader types and verification moved to `loader.rs` (see `loader` module).
@@ -1239,7 +1337,8 @@ pub async fn download_loader_version(
                             .arg(&instance_version)
                             .arg("-loader")
                             .arg(&loader_number)
-                            .arg("-y");
+                            .arg("-y")
+                            .current_dir(std::path::Path::new(&mc_dir_str));
 
                         if let Ok(mut child) = cmd
                             .stdout(std::process::Stdio::piped())
@@ -1416,13 +1515,14 @@ pub async fn install_modpack_version(
         .clone();
 
     let inst_id = uuid::Uuid::new_v4().to_string();
-    let root = instance_dir(&app, &inst_id)?;
+    let folder_name = unique_instance_folder_name(&app, &name)?;
+    let root = instances_root(&app)?.join(&folder_name);
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
 
-    // Create initial instance with installing state
+    // Create initial instance with installing state (uuid in config, folder = name)
     let mut instance = Instance {
         id: inst_id.clone(),
-        name,
+        name: name.clone(),
         version: game_version.clone(),
         mc_version: Some(game_version.clone()),
         state: InstanceState::Installing,
@@ -1438,7 +1538,7 @@ pub async fn install_modpack_version(
         loader_version: None,
     };
 
-    let meta_path = instance_meta_path(&app, &inst_id)?;
+    let meta_path = root.join("instance.json");
     let json = serde_json::to_string_pretty(&instance).map_err(|e| e.to_string())?;
     fs::write(&meta_path, json).map_err(|e| e.to_string())?;
 
@@ -1855,21 +1955,271 @@ async fn install_loader_robust(
 pub async fn install_modrinth_mod(
     app: AppHandle,
     instance_id: String,
-    version_id: String,
+    project_id: String,
+    version_id: Option<String>,
 ) -> Result<(), String> {
-    let version = crate::modrinth::get_version(&version_id).await?;
     let root = instance_dir(&app, &instance_id)?;
+    let meta_text = fs::read_to_string(root.join("instance.json")).map_err(|e| e.to_string())?;
+    let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
+
+    let mc_version = instance
+        .mc_version
+        .as_deref()
+        .unwrap_or(instance.version.as_str());
+    let loader_str = instance.loader.as_deref().unwrap_or("fabric");
+
+    let loader = match loader_str.to_lowercase().as_str() {
+        "fabric" => crate::modrinth::ModLoader::Fabric,
+        "quilt" => crate::modrinth::ModLoader::Quilt,
+        "forge" => crate::modrinth::ModLoader::Forge,
+        "neoforge" => crate::modrinth::ModLoader::NeoForge,
+        _ => crate::modrinth::ModLoader::Fabric,
+    };
+
+    let version: crate::modrinth::ModrinthVersion = if let Some(vid) = version_id {
+        let v = crate::modrinth::get_version(&vid).await?;
+        if v.project_id != project_id {
+            return Err(format!(
+                "Version {} does not belong to project {}",
+                vid, project_id
+            ));
+        }
+        let compatible = v.game_versions.iter().any(|gv| gv == mc_version)
+            && v.loaders.iter().any(|l| l == loader.as_str());
+        if !compatible {
+            return Err(format!(
+                "Version {} is not compatible with Minecraft {} and loader {}",
+                vid, mc_version, loader_str
+            ));
+        }
+        v
+    } else {
+        crate::modrinth::resolve_mod_version(&project_id, mc_version, loader).await?
+    };
+
     let mods_dir = root.join(".minecraft").join("mods");
     fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
 
-    for file in &version.files {
-        // Usually the primary file is the mod jar
-        if file.primary || version.files.len() == 1 {
-            let target = mods_dir.join(&file.filename);
-            crate::download::download_to_file(&file.url, &target).await?;
-            break;
+    let file = crate::modrinth::select_primary_file(&version)?;
+    let target = mods_dir.join(&file.filename);
+    crate::download::download_to_file(&file.url, &target).await?;
+
+    Ok(())
+}
+
+// --- Mods / Screenshots / Worlds / Servers (instance managers) ---
+
+#[derive(serde::Serialize)]
+pub struct ModFileEntry {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+#[tauri::command]
+pub async fn list_instance_mods(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<ModFileEntry>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let mods_dir = root.join(".minecraft").join("mods");
+    if !mods_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(mods_dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let size_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            entries.push(ModFileEntry { name, size_bytes });
         }
     }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(entries)
+}
 
+#[tauri::command]
+pub async fn remove_mod(
+    app: AppHandle,
+    instance_id: String,
+    filename: String,
+) -> Result<(), String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let mods_dir = root.join(".minecraft").join("mods");
+    let path = mods_dir.join(&filename);
+    if !path.starts_with(&mods_dir) {
+        return Err("Invalid path".to_string());
+    }
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct ScreenshotEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn list_instance_screenshots(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<ScreenshotEntry>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let screenshots_dir = root.join(".minecraft").join("screenshots");
+    if !screenshots_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(screenshots_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let path_str = path.to_string_lossy().to_string();
+            entries.push(ScreenshotEntry {
+                name,
+                path: path_str,
+            });
+        }
+    }
+    entries.sort_by(|a, b| b.name.cmp(&a.name));
+    Ok(entries)
+}
+
+#[derive(serde::Serialize)]
+pub struct WorldEntry {
+    pub name: String,
+    pub folder: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn list_instance_worlds(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<WorldEntry>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let saves_dir = root.join(".minecraft").join("saves");
+    if !saves_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(saves_dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            let folder = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            entries.push(WorldEntry {
+                name: folder.clone(),
+                folder: folder.clone(),
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(entries)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ServerEntry {
+    pub name: String,
+    pub ip: String,
+    pub icon: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_instance_servers(
+    _app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<ServerEntry>, String> {
+    let _ = instance_id;
+    // servers.dat is NBT format; full parser can be added later
+    Ok(Vec::new())
+}
+
+#[tauri::command]
+pub async fn get_instance_minecraft_dir(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<String, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let mc = root.join(".minecraft");
+    Ok(mc.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn get_instance_screenshots_dir(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<String, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let dir = root.join(".minecraft").join("screenshots");
+    if (!dir.exists()) {
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn get_instance_saves_dir(app: AppHandle, instance_id: String) -> Result<String, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let dir = root.join(".minecraft").join("saves");
+    if (!dir.exists()) {
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn open_path(path: String) -> Result<(), String> {
+    let path_buf = PathBuf::from(&path);
+    #[cfg(target_os = "windows")]
+    {
+        if path_buf.is_dir() {
+            Command::new("explorer")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        } else {
+            // Open folder and select the file
+            Command::new("explorer")
+                .arg(format!("/select,\"{}\"", path.replace('"', "\"\"")))
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
