@@ -10,23 +10,25 @@ import type {
   ModrinthProjectHit,
   ModrinthVersion,
   LoaderCandidate,
-  ModFileEntry,
   ScreenshotEntry,
   WorldEntry,
   ServerEntry,
 } from "./types/types";
 import {
   SearchIcon,
-  PlusIcon,
   FolderOpenIcon,
   ImageIcon,
   GlobeIcon,
   ServerIcon,
-  Trash2Icon,
 } from "lucide-react";
 import InstancesPage from "./components/InstancesPage";
 import NewInstanceModal from "./components/NewInstanceModal";
 import ModVersionPickerModal from "./components/ModVersionPickerModal";
+import CrashLogViewer from "./components/CrashLogViewer";
+import ModManager from "./components/ModManager";
+import CleanupSettings from "./components/CleanupSettings";
+import DebugSettings from "./components/DebugSettings";
+import CompactDebugSettings from "./components/CompactDebugSettings";
 
 interface JavaCompatibility {
   compatible: boolean;
@@ -89,13 +91,19 @@ function App() {
     { id: number; message: string; type: "success" | "error" }[]
   >([]);
   const [settingsTab, setSettingsTab] = useState<
-    "general" | "mods" | "screenshots" | "worlds" | "servers"
+    | "general"
+    | "mods"
+    | "screenshots"
+    | "worlds"
+    | "servers"
+    | "cleanup"
+    | "debug"
   >("general");
-  const [installedMods, setInstalledMods] = useState<ModFileEntry[]>([]);
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [worlds, setWorlds] = useState<WorldEntry[]>([]);
   const [servers, setServers] = useState<ServerEntry[]>([]);
   const [addModModalOpen, setAddModModalOpen] = useState(false);
+  const [crashLogViewer, setCrashLogViewer] = useState<string | null>(null);
   const [installingModpack, setInstallingModpack] = useState<{
     project: ModrinthProjectHit;
     versionId: string;
@@ -197,13 +205,7 @@ function App() {
 
   useEffect(() => {
     if (!instanceSettingsModal) return;
-    if (settingsTab === "mods") {
-      invoke<ModFileEntry[]>("list_instance_mods", {
-        instanceId: instanceSettingsModal.id,
-      })
-        .then(setInstalledMods)
-        .catch((e) => addToast(String(e), "error"));
-    } else if (settingsTab === "screenshots") {
+    if (settingsTab === "screenshots") {
       invoke<ScreenshotEntry[]>("list_instance_screenshots", {
         instanceId: instanceSettingsModal.id,
       })
@@ -390,65 +392,126 @@ function App() {
 
           {page === "settings" && settings && (
             <section>
-              <header className="page-header">
+              <header className="page-header" style={{ marginBottom: 32 }}>
                 <h1 className="page-title">Settings</h1>
               </header>
-              <div className="settings-section">
-                <div className="settings-group">
-                  <h3 style={{ marginBottom: 16 }}>Java configuration</h3>
-                  <div className="settings-row-advanced">
-                    <div className="settings-field">
-                      <label>Min Memory (MB)</label>
-                      <input
-                        type="number"
-                        value={settings.min_memory}
-                        onChange={(e) =>
-                          updateSettings({
-                            min_memory: parseInt(e.target.value) || 0,
-                          })
-                        }
-                      />
-                    </div>
-                    <div className="settings-field">
-                      <label>Max Memory (MB)</label>
-                      <input
-                        type="number"
-                        value={settings.max_memory}
-                        onChange={(e) =>
-                          updateSettings({
-                            max_memory: parseInt(e.target.value) || 0,
-                          })
-                        }
-                      />
+
+              <div className="tabs-header" style={{ marginBottom: 0 }}>
+                <div
+                  className={`tab-item ${settingsTab === "general" ? "active" : ""}`}
+                  onClick={() => setSettingsTab("general")}
+                >
+                  General
+                </div>
+                <div
+                  className={`tab-item ${settingsTab === "cleanup" ? "active" : ""}`}
+                  onClick={() => setSettingsTab("cleanup")}
+                >
+                  Cleanup
+                </div>
+                <div
+                  className={`tab-item ${settingsTab === "debug" ? "active" : ""}`}
+                  onClick={() => setSettingsTab("debug")}
+                >
+                  Debug
+                </div>
+              </div>
+
+              <div className="tab-content" style={{ padding: "24px" }}>
+                {settingsTab === "general" && (
+                  <div className="settings-section">
+                    <div className="settings-group">
+                      <h3 style={{ marginBottom: 24, marginTop: 0 }}>
+                        Java Configuration
+                      </h3>
+                      <div
+                        className="settings-row-advanced"
+                        style={{ marginBottom: 20 }}
+                      >
+                        <div className="settings-field">
+                          <label>Min Memory (MB)</label>
+                          <input
+                            type="number"
+                            value={settings.min_memory}
+                            onChange={(e) =>
+                              updateSettings({
+                                min_memory: parseInt(e.target.value) || 0,
+                              })
+                            }
+                          />
+                        </div>
+                        <div className="settings-field">
+                          <label>Max Memory (MB)</label>
+                          <input
+                            type="number"
+                            value={settings.max_memory}
+                            onChange={(e) =>
+                              updateSettings({
+                                max_memory: parseInt(e.target.value) || 0,
+                              })
+                            }
+                          />
+                        </div>
+                      </div>
+                      <div
+                        className="settings-field"
+                        style={{ marginBottom: 20 }}
+                      >
+                        <label>Global Java Path</label>
+                        <input
+                          type="text"
+                          value={settings.global_java_path || ""}
+                          onChange={(e) =>
+                            updateSettings({
+                              global_java_path: e.target.value || undefined,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 12,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={settings.skip_java_check || false}
+                            onChange={(e) =>
+                              updateSettings({
+                                skip_java_check: e.target.checked,
+                              })
+                            }
+                          />
+                          <span>Skip Java compatibility check (globally)</span>
+                        </label>
+                      </div>
                     </div>
                   </div>
-                  <div className="settings-field" style={{ marginTop: 12 }}>
-                    <label>Global Java Path</label>
-                    <input
-                      type="text"
-                      value={settings.global_java_path || ""}
-                      onChange={(e) =>
-                        updateSettings({
-                          global_java_path: e.target.value || undefined,
-                        })
+                )}
+
+                {settingsTab === "cleanup" && (
+                  <div style={{ padding: "24px" }}>
+                    <CleanupSettings
+                      onCleanupComplete={() => {
+                        addToast("Cleanup completed successfully", "success");
+                      }}
+                    />
+                  </div>
+                )}
+
+                {settingsTab === "debug" && (
+                  <div style={{ padding: "24px" }}>
+                    <DebugSettings
+                      instances={instances}
+                      onOpenCrashLogs={(instanceId: string) =>
+                        setCrashLogViewer(instanceId)
                       }
                     />
                   </div>
-                  <div className="settings-field" style={{ marginTop: 12 }}>
-                    <label
-                      style={{ display: "flex", alignItems: "center", gap: 12 }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={settings.skip_java_check || false}
-                        onChange={(e) =>
-                          updateSettings({ skip_java_check: e.target.checked })
-                        }
-                      />
-                      <span>Skip Java compatibility check (globally)</span>
-                    </label>
-                  </div>
-                </div>
+                )}
               </div>
             </section>
           )}
@@ -463,9 +526,9 @@ function App() {
           <div
             className="dialog-modal"
             onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: 650, width: "90%" }}
+            style={{ maxWidth: 650, width: "90%", padding: "32px" }}
           >
-            <h2 className="dialog-title">
+            <h2 className="dialog-title" style={{ marginBottom: "20px" }}>
               Manage: {instanceSettingsModal.name}
             </h2>
 
@@ -499,6 +562,12 @@ function App() {
                 onClick={() => setSettingsTab("servers")}
               >
                 Servers
+              </div>
+              <div
+                className={`tab-item ${settingsTab === "debug" ? "active" : ""}`}
+                onClick={() => setSettingsTab("debug")}
+              >
+                Debug
               </div>
             </div>
 
@@ -640,113 +709,21 @@ function App() {
               )}
               {settingsTab === "mods" && (
                 <div style={{ padding: 16 }}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      marginBottom: 16,
+                  <ModManager
+                    instanceId={instanceSettingsModal.id}
+                    onRefresh={async () => {
+                      // Refresh instance data
+                      const instances =
+                        await invoke<Instance[]>("list_instances");
+                      setInstances(instances);
+                      const updated = instances.find(
+                        (i) => i.id === instanceSettingsModal.id,
+                      );
+                      if (updated) {
+                        setInstanceSettingsModal(updated);
+                      }
                     }}
-                  >
-                    <span
-                      style={{
-                        fontSize: "0.9rem",
-                        color: "var(--text-secondary)",
-                      }}
-                    >
-                      {installedMods.length} mod
-                      {installedMods.length !== 1 ? "s" : ""} installed
-                    </span>
-                    <button
-                      className="btn btn-primary"
-                      onClick={() => setAddModModalOpen(true)}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "8px 14px",
-                      }}
-                    >
-                      <PlusIcon size={18} /> Add mod
-                    </button>
-                  </div>
-                  <div
-                    className="mod-search-results"
-                    style={{
-                      maxHeight: 280,
-                      minHeight: 80,
-                    }}
-                  >
-                    {installedMods.length === 0 ? (
-                      <div
-                        style={{
-                          padding: 24,
-                          textAlign: "center",
-                          color: "var(--text-secondary)",
-                          fontSize: "0.9rem",
-                        }}
-                      >
-                        No mods installed. Click &quot;Add mod&quot; to browse
-                        Modrinth.
-                      </div>
-                    ) : (
-                      installedMods.map((mod) => (
-                        <div
-                          key={mod.name}
-                          className="mod-result-item"
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                          }}
-                        >
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div
-                              style={{
-                                fontWeight: 600,
-                                fontSize: "0.9rem",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
-                              {mod.name}
-                            </div>
-                            <div
-                              style={{
-                                fontSize: "0.75rem",
-                                color: "var(--text-secondary)",
-                              }}
-                            >
-                              {(mod.size_bytes / 1024).toFixed(1)} KB
-                            </div>
-                          </div>
-                          <button
-                            className="btn btn-transparent"
-                            title="Remove mod"
-                            onClick={async () => {
-                              if (!instanceSettingsModal) return;
-                              try {
-                                await invoke("remove_mod", {
-                                  instanceId: instanceSettingsModal.id,
-                                  filename: mod.name,
-                                });
-                                setInstalledMods((prev) =>
-                                  prev.filter((m) => m.name !== mod.name),
-                                );
-                                addToast(`Removed ${mod.name}`, "success");
-                              } catch (e) {
-                                addToast(String(e), "error");
-                              }
-                            }}
-                            style={{ color: "var(--error-color)" }}
-                          >
-                            <Trash2Icon size={16} />
-                          </button>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                  />
                 </div>
               )}
               {settingsTab === "screenshots" && (
@@ -801,7 +778,8 @@ function App() {
                       maxHeight: 320,
                       minHeight: 80,
                       display: "grid",
-                      gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
+                      gridTemplateColumns:
+                        "repeat(auto-fill, minmax(140px, 1fr))",
                       gap: 12,
                       padding: 12,
                     }}
@@ -974,7 +952,9 @@ function App() {
                           <button
                             className="btn btn-secondary"
                             style={{ padding: "6px 12px", fontSize: "0.8rem" }}
-                            onClick={() => invoke("open_path", { path: w.path })}
+                            onClick={() =>
+                              invoke("open_path", { path: w.path })
+                            }
                           >
                             Open folder
                           </button>
@@ -1095,6 +1075,15 @@ function App() {
                   </div>
                 </div>
               )}
+
+              {settingsTab === "debug" && instanceSettingsModal && (
+                <CompactDebugSettings
+                  instance={instanceSettingsModal}
+                  onOpenCrashLogs={(instanceId: string) =>
+                    setCrashLogViewer(instanceId)
+                  }
+                />
+              )}
             </div>
 
             <div
@@ -1137,7 +1126,7 @@ function App() {
                     if (
                       prevInstance &&
                       prevInstance.java_path_override !==
-                      updatedInstance.java_path_override
+                        updatedInstance.java_path_override
                     ) {
                       updatedInstance.java_warning_ignored = false;
                     }
@@ -1170,10 +1159,7 @@ function App() {
             style={{ maxWidth: 520, width: "90%" }}
           >
             <h2 className="dialog-title">Add mod from Modrinth</h2>
-            <div
-              className="search-container"
-              style={{ marginBottom: 16 }}
-            >
+            <div className="search-container" style={{ marginBottom: 16 }}>
               <input
                 type="text"
                 className="search-input"
@@ -1284,19 +1270,22 @@ function App() {
                   </button>
                 </div>
               )) ?? (
-                  <div
-                    style={{
-                      padding: 24,
-                      textAlign: "center",
-                      color: "var(--text-secondary)",
-                      fontSize: "0.9rem",
-                    }}
-                  >
-                    Search for mods to add
-                  </div>
-                )}
+                <div
+                  style={{
+                    padding: 24,
+                    textAlign: "center",
+                    color: "var(--text-secondary)",
+                    fontSize: "0.9rem",
+                  }}
+                >
+                  Search for mods to add
+                </div>
+              )}
             </div>
-            <div className="dialog-actions" style={{ justifyContent: "flex-end" }}>
+            <div
+              className="dialog-actions"
+              style={{ justifyContent: "flex-end" }}
+            >
               <button
                 className="btn btn-secondary"
                 onClick={() => {
@@ -1334,11 +1323,9 @@ function App() {
                 addToast(`${modVersionPicker.hit.title} installed!`, "success");
                 setModVersionPicker(null);
                 setAddModModalOpen(false);
-                const mods = await invoke<ModFileEntry[]>(
-                  "list_instance_mods",
-                  { instanceId: instanceSettingsModal.id },
-                );
-                setInstalledMods(mods);
+                // Refresh instances to update mod count
+                const instances = await invoke<Instance[]>("list_instances");
+                setInstances(instances);
               } catch (e) {
                 addToast(String(e), "error");
               }
@@ -1825,6 +1812,13 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {crashLogViewer && (
+        <CrashLogViewer
+          instanceId={crashLogViewer}
+          onClose={() => setCrashLogViewer(null)}
+        />
       )}
 
       <div className="toast-container">

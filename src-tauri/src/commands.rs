@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -117,7 +117,6 @@ pub fn instance_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
                 if let Ok(text) = fs::read_to_string(&meta_path) {
                     if let Ok(instance) = serde_json::from_str::<Instance>(&text) {
                         if instance.id == id {
-                            std::println!("Checking instance at {:?}", entry.path());
                             return Ok(entry.path());
                         }
                     }
@@ -180,6 +179,8 @@ pub async fn create_instance(
         state: InstanceState::Installing,
         created_at: chrono::Utc::now().timestamp() as u64,
         last_played: None,
+        playtime_minutes: None,
+        last_crash: None,
         java_path: None,
         java_path_override: None,
         max_memory: None,
@@ -1528,6 +1529,8 @@ pub async fn install_modpack_version(
         state: InstanceState::Installing,
         created_at: chrono::Utc::now().timestamp() as u64,
         last_played: None,
+        playtime_minutes: None,
+        last_crash: None,
         java_path: None,
         java_path_override: None,
         max_memory: None,
@@ -2173,7 +2176,7 @@ pub async fn get_instance_screenshots_dir(
 ) -> Result<String, String> {
     let root = instance_dir(&app, &instance_id)?;
     let dir = root.join(".minecraft").join("screenshots");
-    if (!dir.exists()) {
+    if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     }
     Ok(dir.to_string_lossy().to_string())
@@ -2183,7 +2186,7 @@ pub async fn get_instance_screenshots_dir(
 pub async fn get_instance_saves_dir(app: AppHandle, instance_id: String) -> Result<String, String> {
     let root = instance_dir(&app, &instance_id)?;
     let dir = root.join(".minecraft").join("saves");
-    if (!dir.exists()) {
+    if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     }
     Ok(dir.to_string_lossy().to_string())
@@ -2222,4 +2225,582 @@ pub async fn open_path(path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+// --- Crash Detection & Log Management ---
+
+#[derive(serde::Serialize)]
+pub struct CrashLog {
+    pub timestamp: u64,
+    pub content: String,
+    pub crash_type: String,
+    pub summary: String,
+}
+
+#[tauri::command]
+pub async fn get_instance_crash_logs(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<CrashLog>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let logs_dir = root.join("logs");
+
+    if !logs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut crash_logs = Vec::new();
+
+    // Look for crash-reports folder
+    let crash_reports_dir = logs_dir.join("crash-reports");
+    if crash_reports_dir.exists() {
+        for entry in fs::read_dir(crash_reports_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "txt") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let timestamp = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "metadata error")
+                        })
+                        .and_then(|t| {
+                            t.duration_since(std::time::UNIX_EPOCH).map_err(|_| {
+                                std::io::Error::new(std::io::ErrorKind::Other, "time error")
+                            })
+                        })
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    let (crash_type, summary) = parse_crash_log(&content);
+
+                    crash_logs.push(CrashLog {
+                        timestamp,
+                        content,
+                        crash_type,
+                        summary,
+                    });
+                }
+            }
+        }
+    }
+
+    // Also check latest.log for crashes
+    let latest_log = logs_dir.join("latest.log");
+    if latest_log.exists() {
+        if let Ok(content) = fs::read_to_string(&latest_log) {
+            if content.contains("Exception")
+                || content.contains("Error")
+                || content.contains("Crash")
+            {
+                let timestamp = latest_log
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "metadata error"))
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH).map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "time error")
+                        })
+                    })
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let (crash_type, summary) = parse_crash_log(&content);
+
+                crash_logs.push(CrashLog {
+                    timestamp,
+                    content,
+                    crash_type,
+                    summary,
+                });
+            }
+        }
+    }
+
+    crash_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(crash_logs)
+}
+
+fn parse_crash_log(content: &str) -> (String, String) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Look for common crash patterns
+    for line in &lines {
+        if line.contains("OutOfMemoryError") {
+            return (
+                "Memory".to_string(),
+                "Out of memory - increase allocated RAM".to_string(),
+            );
+        }
+        if line.contains("ClassNotFoundException") || line.contains("NoClassDefFoundError") {
+            return (
+                "Mod Conflict".to_string(),
+                "Missing or incompatible mod detected".to_string(),
+            );
+        }
+        if line.contains("UnsupportedClassVersionError") {
+            return (
+                "Java Version".to_string(),
+                "Wrong Java version - check Java compatibility".to_string(),
+            );
+        }
+        if line.contains("ModuleLoadException") || line.contains("FabricLoader") {
+            return (
+                "Loader Issue".to_string(),
+                "Mod loader problem - check mod compatibility".to_string(),
+            );
+        }
+    }
+
+    // Look for exception types
+    for line in &lines {
+        if let Some(start) = line.find("Exception") {
+            if let Some(end) = line[..start].rfind(' ') {
+                let exception_type = &line[end + 1..start + 9];
+                return (
+                    "Exception".to_string(),
+                    format!("Game crashed: {}", exception_type),
+                );
+            }
+        }
+    }
+
+    (
+        "Unknown".to_string(),
+        "Game crashed - check logs for details".to_string(),
+    )
+}
+
+#[tauri::command]
+pub async fn get_last_launch_log(app: AppHandle, instance_id: String) -> Result<String, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let log_file = root.join("last_launch.log");
+
+    if log_file.exists() {
+        fs::read_to_string(log_file).map_err(|e| e.to_string())
+    } else {
+        Ok("No launch log available".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn clear_instance_logs(app: AppHandle, instance_id: String) -> Result<(), String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let logs_dir = root.join("logs");
+
+    if logs_dir.exists() {
+        // Clear crash reports
+        let crash_reports = logs_dir.join("crash-reports");
+        if crash_reports.exists() {
+            fs::remove_dir_all(&crash_reports).map_err(|e| e.to_string())?;
+            fs::create_dir_all(&crash_reports).map_err(|e| e.to_string())?;
+        }
+
+        // Clear latest.log
+        let latest_log = logs_dir.join("latest.log");
+        if latest_log.exists() {
+            fs::remove_file(&latest_log).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Clear last launch log
+    let last_launch = root.join("last_launch.log");
+    if last_launch.exists() {
+        fs::remove_file(&last_launch).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+// --- Mod Update Detection ---
+
+#[derive(serde::Serialize)]
+pub struct ModUpdateInfo {
+    pub filename: String,
+    pub current_version: String,
+    pub latest_version: String,
+    pub project_id: String,
+    pub update_available: bool,
+}
+
+#[tauri::command]
+pub async fn check_mod_updates(
+    app: AppHandle,
+    instance_id: String,
+) -> Result<Vec<ModUpdateInfo>, String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let meta_text = fs::read_to_string(root.join("instance.json")).map_err(|e| e.to_string())?;
+    let instance: Instance = serde_json::from_str(&meta_text).map_err(|e| e.to_string())?;
+
+    let mc_version = instance
+        .mc_version
+        .as_deref()
+        .unwrap_or(instance.version.as_str());
+    let loader_str = instance.loader.as_deref().unwrap_or("fabric");
+
+    let loader = match loader_str.to_lowercase().as_str() {
+        "fabric" => crate::modrinth::ModLoader::Fabric,
+        "quilt" => crate::modrinth::ModLoader::Quilt,
+        "forge" => crate::modrinth::ModLoader::Forge,
+        "neoforge" => crate::modrinth::ModLoader::NeoForge,
+        _ => crate::modrinth::ModLoader::Fabric,
+    };
+
+    let mods_dir = root.join(".minecraft").join("mods");
+    if !mods_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut update_info = Vec::new();
+
+    for entry in fs::read_dir(mods_dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "jar") {
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Try to extract mod info from filename or jar metadata
+            if let Ok(mod_info) = extract_mod_info(&path).await {
+                if let Some(project_id) = mod_info.project_id {
+                    // Check for updates on Modrinth
+                    match crate::modrinth::resolve_mod_version(&project_id, mc_version, loader)
+                        .await
+                    {
+                        Ok(latest_version) => {
+                            let update_available =
+                                mod_info.version != latest_version.version_number;
+                            update_info.push(ModUpdateInfo {
+                                filename,
+                                current_version: mod_info.version,
+                                latest_version: latest_version.version_number,
+                                project_id,
+                                update_available,
+                            });
+                        }
+                        Err(_) => {
+                            // Mod not found on Modrinth or other error
+                            update_info.push(ModUpdateInfo {
+                                filename,
+                                current_version: mod_info.version,
+                                latest_version: "Unknown".to_string(),
+                                project_id,
+                                update_available: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(update_info)
+}
+
+#[derive(Debug)]
+struct ModInfo {
+    pub version: String,
+    pub project_id: Option<String>,
+    pub name: String,
+}
+
+async fn extract_mod_info(jar_path: &std::path::Path) -> Result<ModInfo, String> {
+    // Try to read fabric.mod.json from the jar file
+    let file = std::fs::File::open(jar_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    // Look for fabric.mod.json
+    if let Ok(mut fabric_mod_file) = archive.by_name("fabric.mod.json") {
+        let mut contents = String::new();
+        fabric_mod_file
+            .read_to_string(&mut contents)
+            .map_err(|e| e.to_string())?;
+
+        if let Ok(fabric_mod_json) = serde_json::from_str::<serde_json::Value>(&contents) {
+            let version = fabric_mod_json["version"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let name = fabric_mod_json["name"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Try to find Modrinth project ID in custom fields
+            let project_id = fabric_mod_json["custom"]["modrinth"]["project-id"]
+                .as_str()
+                .map(|s| s.to_string());
+
+            return Ok(ModInfo {
+                version,
+                project_id,
+                name,
+            });
+        }
+    }
+
+    // Fallback: try to parse from filename
+    let filename = jar_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    // Common patterns: modname-version.jar, modname_version.jar
+    let parts: Vec<&str> = filename.split(&['-', '_'][..]).collect();
+    if parts.len() >= 2 {
+        let version = parts.last().unwrap_or(&"unknown").to_string();
+        let name = parts[..parts.len() - 1].join("-");
+
+        Ok(ModInfo {
+            version,
+            project_id: None,
+            name,
+        })
+    } else {
+        Ok(ModInfo {
+            version: "unknown".to_string(),
+            project_id: None,
+            name: filename.to_string(),
+        })
+    }
+}
+
+// --- Mod Enable/Disable ---
+
+#[tauri::command]
+pub async fn toggle_mod(
+    app: AppHandle,
+    instance_id: String,
+    filename: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let root = instance_dir(&app, &instance_id)?;
+    let mods_dir = root.join(".minecraft").join("mods");
+
+    let current_path = mods_dir.join(&filename);
+    let disabled_path = if enabled {
+        // Enabling: remove .disabled extension
+        if filename.ends_with(".disabled") {
+            mods_dir.join(&filename[..filename.len() - 9])
+        } else {
+            return Err("Mod is already enabled".to_string());
+        }
+    } else {
+        // Disabling: add .disabled extension
+        if !filename.ends_with(".disabled") {
+            mods_dir.join(format!("{}.disabled", filename))
+        } else {
+            return Err("Mod is already disabled".to_string());
+        }
+    };
+
+    if !current_path.starts_with(&mods_dir) || !disabled_path.starts_with(&mods_dir) {
+        return Err("Invalid path".to_string());
+    }
+
+    if current_path.exists() {
+        fs::rename(&current_path, &disabled_path).map_err(|e| e.to_string())?;
+    } else {
+        return Err("Mod file not found".to_string());
+    }
+
+    Ok(())
+}
+
+// --- Cleanup Operations ---
+
+#[derive(serde::Serialize)]
+pub struct CleanupInfo {
+    pub unused_versions: Vec<String>,
+    pub orphaned_libraries: Vec<String>,
+    pub cache_size_mb: u64,
+    pub total_cleanup_mb: u64,
+}
+
+#[tauri::command]
+pub async fn get_cleanup_info(app: AppHandle) -> Result<CleanupInfo, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("minecraft");
+    let instances_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("instances");
+
+    // Get all instances to see which versions are in use
+    let mut used_versions = std::collections::HashSet::new();
+    if instances_dir.exists() {
+        for entry in fs::read_dir(&instances_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            if entry.path().is_dir() {
+                let instance_json = entry.path().join("instance.json");
+                if let Ok(content) = fs::read_to_string(&instance_json) {
+                    if let Ok(instance) = serde_json::from_str::<Instance>(&content) {
+                        used_versions.insert(instance.version.clone());
+                        if let Some(mc_version) = instance.mc_version {
+                            used_versions.insert(mc_version);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find unused versions
+    let mut unused_versions = Vec::new();
+    let versions_dir = base.join("versions");
+    if versions_dir.exists() {
+        for entry in fs::read_dir(&versions_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            if entry.path().is_dir() {
+                let version_name = entry.file_name().to_string_lossy().to_string();
+                if !used_versions.contains(&version_name) {
+                    unused_versions.push(version_name);
+                }
+            }
+        }
+    }
+
+    // Calculate cache sizes (simplified)
+    let assets_dir = base.join("assets");
+    let cache_size_mb = if assets_dir.exists() {
+        calculate_dir_size(&assets_dir)? / 1024 / 1024
+    } else {
+        0
+    };
+
+    // Estimate cleanup size
+    let mut total_cleanup_mb = cache_size_mb;
+    for version in &unused_versions {
+        let version_dir = versions_dir.join(version);
+        if version_dir.exists() {
+            total_cleanup_mb += calculate_dir_size(&version_dir)? / 1024 / 1024;
+        }
+    }
+
+    Ok(CleanupInfo {
+        unused_versions,
+        orphaned_libraries: Vec::new(), // TODO: implement library orphan detection
+        cache_size_mb,
+        total_cleanup_mb,
+    })
+}
+
+#[tauri::command]
+pub async fn cleanup_unused_versions(app: AppHandle) -> Result<Vec<String>, String> {
+    let cleanup_info = get_cleanup_info(app.clone()).await?;
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("minecraft");
+    let versions_dir = base.join("versions");
+
+    let mut cleaned = Vec::new();
+
+    for version in cleanup_info.unused_versions {
+        let version_dir = versions_dir.join(&version);
+        if version_dir.exists() {
+            fs::remove_dir_all(&version_dir).map_err(|e| e.to_string())?;
+            cleaned.push(version);
+        }
+    }
+
+    Ok(cleaned)
+}
+
+#[tauri::command]
+pub async fn clear_asset_cache(app: AppHandle) -> Result<u64, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("minecraft");
+    let assets_dir = base.join("assets");
+
+    if !assets_dir.exists() {
+        return Ok(0);
+    }
+
+    let size_before = calculate_dir_size(&assets_dir)?;
+
+    // Clear objects cache but keep indexes
+    let objects_dir = assets_dir.join("objects");
+    if objects_dir.exists() {
+        fs::remove_dir_all(&objects_dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&objects_dir).map_err(|e| e.to_string())?;
+    }
+
+    Ok(size_before / 1024 / 1024) // Return MB cleared
+}
+
+fn calculate_dir_size(dir: &std::path::Path) -> Result<u64, String> {
+    let mut size = 0;
+
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                size += calculate_dir_size(&path)?;
+            } else {
+                size += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+
+    Ok(size)
+}
+// --- System Information ---
+
+#[derive(serde::Serialize)]
+pub struct SystemInfo {
+    pub os: String,
+    pub arch: String,
+    pub version: String,
+    pub java_version: Option<String>,
+    pub java_path: Option<String>,
+    pub total_memory: Option<u64>,
+    pub launcher_version: String,
+}
+
+#[tauri::command]
+pub async fn get_system_info(app: AppHandle) -> Result<SystemInfo, String> {
+    let settings = crate::settings::get_settings(app.clone()).unwrap_or_default();
+
+    // Try to get Java version if path is available
+    let mut java_version = None;
+    let java_path = settings.global_java_path.clone();
+
+    if let Some(ref path) = java_path {
+        if let Ok(output) = std::process::Command::new(path)
+            .args(&["-version"])
+            .output()
+        {
+            let version_output = String::from_utf8_lossy(&output.stderr);
+            if let Some(line) = version_output.lines().next() {
+                java_version = Some(line.to_string());
+            }
+        }
+    }
+
+    Ok(SystemInfo {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        version: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        java_version,
+        java_path,
+        total_memory: None, // Could be implemented with system info crate
+        launcher_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }

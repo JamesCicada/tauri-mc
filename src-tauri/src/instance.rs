@@ -8,6 +8,8 @@ pub struct Instance {
     pub state: InstanceState,
     pub created_at: u64,
     pub last_played: Option<u64>,
+    pub playtime_minutes: Option<u32>,
+    pub last_crash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub java_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,5 +37,6 @@ pub enum InstanceState {
     Installing,
     Ready,
     Running,
+    Crashed,
     Error,
 }

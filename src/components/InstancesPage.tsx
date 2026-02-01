@@ -9,6 +9,7 @@ interface InstancesPageProps {
   onPlay: (instance: Instance) => void;
   onLogs: (instance: Instance) => void;
   onSettings: (instance: Instance) => void;
+  onViewCrashLogs?: (instance: Instance) => void;
 }
 
 export default function InstancesPage({
@@ -17,6 +18,7 @@ export default function InstancesPage({
   onPlay,
   onLogs,
   onSettings,
+  onViewCrashLogs,
 }: InstancesPageProps) {
   return (
     <>
@@ -36,6 +38,7 @@ export default function InstancesPage({
                 onPlay={onPlay}
                 onLogs={onLogs}
                 onSettings={onSettings}
+                onViewCrashLogs={onViewCrashLogs}
               />
             ))}
           </div>

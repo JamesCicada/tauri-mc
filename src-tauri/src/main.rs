@@ -18,13 +18,46 @@ mod settings;
 mod version;
 
 use commands::{
-    check_java_compatibility, check_version_usage, create_instance, delete_instance,
-    download_loader_version, download_version, find_loader_candidates, get_compatible_mod_versions,
-    get_instance_minecraft_dir, get_instance_saves_dir, get_instance_screenshots_dir,
-    get_loader_versions, get_popular_mods, get_project_versions, get_version_manifest,
-    install_loader, install_modpack_version, install_modrinth_mod, kill_instance, launch_instance,
-    list_instance_mods, list_instance_screenshots, list_instance_servers, list_instance_worlds,
-    list_instances, open_path, remove_mod, save_instance, search_projects, ChildProcessState,
+    check_java_compatibility,
+    check_mod_updates,
+    check_version_usage,
+    cleanup_unused_versions,
+    clear_asset_cache,
+    clear_instance_logs,
+    create_instance,
+    delete_instance,
+    download_loader_version,
+    download_version,
+    find_loader_candidates,
+    get_cleanup_info,
+    get_compatible_mod_versions,
+    // New commands
+    get_instance_crash_logs,
+    get_instance_minecraft_dir,
+    get_instance_saves_dir,
+    get_instance_screenshots_dir,
+    get_last_launch_log,
+    get_loader_versions,
+    get_popular_mods,
+    get_project_versions,
+    get_system_info,
+    get_version_manifest,
+    install_loader,
+    install_modpack_version,
+    install_modrinth_mod,
+    kill_instance,
+    launch_instance,
+    list_instance_mods,
+    list_instance_screenshots,
+    list_instance_servers,
+    list_instance_worlds,
+    list_instances,
+    open_path,
+    remove_mod,
+    save_instance,
+    search_projects,
+    toggle_mod,
+    ChildProcessState,
 };
 use settings::{get_settings, save_settings};
 use tauri::Manager;
@@ -99,6 +132,17 @@ fn main() {
             get_instance_screenshots_dir,
             get_instance_saves_dir,
             open_path,
+            // New crash detection and mod management commands
+            get_instance_crash_logs,
+            get_last_launch_log,
+            clear_instance_logs,
+            check_mod_updates,
+            toggle_mod,
+            // New cleanup commands
+            get_cleanup_info,
+            cleanup_unused_versions,
+            clear_asset_cache,
+            get_system_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
