@@ -168,15 +168,6 @@ License to be decided.
 
 ---
 
-## 🌐 Socials / Community
-
-- GitHub: **(link here)**
-- Discord: **(link here)**
-- Twitter / X: **(link here)**
-- Website: **(optional)**
-
----
-
 ## 🧠 Final Note
 
 This launcher exists because modern Minecraft launchers are often:
