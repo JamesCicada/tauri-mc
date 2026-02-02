@@ -26,7 +26,6 @@ import NewInstanceModal from "./components/NewInstanceModal";
 import ModVersionPickerModal from "./components/ModVersionPickerModal";
 import CrashLogViewer from "./components/CrashLogViewer";
 import ModManager from "./components/ModManager";
-import CleanupSettings from "./components/CleanupSettings";
 import DebugSettings from "./components/DebugSettings";
 import CompactDebugSettings from "./components/CompactDebugSettings";
 
@@ -91,13 +90,7 @@ function App() {
     { id: number; message: string; type: "success" | "error" }[]
   >([]);
   const [settingsTab, setSettingsTab] = useState<
-    | "general"
-    | "mods"
-    | "screenshots"
-    | "worlds"
-    | "servers"
-    | "cleanup"
-    | "debug"
+    "general" | "mods" | "screenshots" | "worlds" | "servers" | "debug"
   >("general");
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [worlds, setWorlds] = useState<WorldEntry[]>([]);
@@ -134,10 +127,13 @@ function App() {
   const addToast = useCallback(
     (message: string, type: "success" | "error" = "success") => {
       const id = Date.now();
+      if (type === "error") {
+        console.error("Toast error:", message);
+      }
       setToasts((prev) => [...prev, { id, message, type }]);
       setTimeout(
         () => setToasts((prev) => prev.filter((t) => t.id !== id)),
-        3000,
+        15000,
       );
     },
     [],
@@ -404,12 +400,6 @@ function App() {
                   General
                 </div>
                 <div
-                  className={`tab-item ${settingsTab === "cleanup" ? "active" : ""}`}
-                  onClick={() => setSettingsTab("cleanup")}
-                >
-                  Cleanup
-                </div>
-                <div
                   className={`tab-item ${settingsTab === "debug" ? "active" : ""}`}
                   onClick={() => setSettingsTab("debug")}
                 >
@@ -489,16 +479,6 @@ function App() {
                         </label>
                       </div>
                     </div>
-                  </div>
-                )}
-
-                {settingsTab === "cleanup" && (
-                  <div style={{ padding: "24px" }}>
-                    <CleanupSettings
-                      onCleanupComplete={() => {
-                        addToast("Cleanup completed successfully", "success");
-                      }}
-                    />
                   </div>
                 )}
 
@@ -1126,7 +1106,7 @@ function App() {
                     if (
                       prevInstance &&
                       prevInstance.java_path_override !==
-                        updatedInstance.java_path_override
+                      updatedInstance.java_path_override
                     ) {
                       updatedInstance.java_warning_ignored = false;
                     }
@@ -1270,17 +1250,17 @@ function App() {
                   </button>
                 </div>
               )) ?? (
-                <div
-                  style={{
-                    padding: 24,
-                    textAlign: "center",
-                    color: "var(--text-secondary)",
-                    fontSize: "0.9rem",
-                  }}
-                >
-                  Search for mods to add
-                </div>
-              )}
+                  <div
+                    style={{
+                      padding: 24,
+                      textAlign: "center",
+                      color: "var(--text-secondary)",
+                      fontSize: "0.9rem",
+                    }}
+                  >
+                    Search for mods to add
+                  </div>
+                )}
             </div>
             <div
               className="dialog-actions"

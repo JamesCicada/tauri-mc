@@ -968,7 +968,15 @@ pub async fn launch_instance(
         .arg(mc_root.join("assets").to_string_lossy().to_string())
         .arg("--assetIndex")
         .arg(&version.assetIndex.id);
-
+    std::println!("Asset index ID: {}", version.assetIndex.id);
+    std::println!(
+        "Version JSON: {}",
+        serde_json::to_string_pretty(&version.assetIndex).unwrap()
+    );
+    std::println!(
+        "Assets directory: {}",
+        mc_root.join("assets").to_string_lossy().to_string()
+    );
     // Run game with CWD = game dir so mods (e.g. Crash Assistant) write config to instance/.minecraft/config/, not project folder
     command.current_dir(&game_dir);
 

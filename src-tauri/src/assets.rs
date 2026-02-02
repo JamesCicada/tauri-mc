@@ -6,7 +6,7 @@ pub struct AssetIndexJson {
     pub objects: HashMap<String, AssetObject>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AssetObject {
     pub hash: String,
     pub size: u64,
